@@ -348,22 +348,43 @@ fn interp(template: &str, env: &Env) -> Result<String, EvalError> {
 }
 
 /// Evaluate a template-string expression: `var` | `var+N` | `var-N`.
+///
+/// Plain-variable resolution is tried first so kebab-case variable
+/// names like `name-prefix` are *not* mis-parsed as `name - prefix`.
+/// Arithmetic only fires when the LHS resolves to an integer-typed
+/// variable AND the RHS parses as an integer literal.
 fn eval_template_expr(expr: &str, env: &Env) -> Result<String, EvalError> {
-    if let Some(idx) = expr.find('+') {
-        let var = &expr[..idx].trim();
-        let off: i64 = expr[idx + 1..].trim().parse().map_err(|_| EvalError::Type("int"))?;
-        let v = env.get(var)?.parse::<i64>().map_err(|_| EvalError::Type("int var"))?;
+    let trimmed = expr.trim();
+    if env.get(trimmed).is_ok() {
+        return env.get(trimmed);
+    }
+    if let Some(idx) = trimmed.find('+') {
+        let var = trimmed[..idx].trim();
+        let off: i64 = trimmed[idx + 1..]
+            .trim()
+            .parse()
+            .map_err(|_| EvalError::Type("int"))?;
+        let v = env
+            .get(var)?
+            .parse::<i64>()
+            .map_err(|_| EvalError::Type("int var"))?;
         return Ok((v + off).to_string());
     }
-    if let Some(idx) = expr.find('-') {
+    if let Some(idx) = trimmed.rfind('-') {
         if idx > 0 {
-            let var = &expr[..idx].trim();
-            let off: i64 = expr[idx + 1..].trim().parse().map_err(|_| EvalError::Type("int"))?;
-            let v = env.get(var)?.parse::<i64>().map_err(|_| EvalError::Type("int var"))?;
-            return Ok((v - off).to_string());
+            // Only treat as arithmetic if RHS is a pure integer literal AND
+            // LHS resolves to an integer-typed loop / scalar variable.
+            if let Ok(off) = trimmed[idx + 1..].trim().parse::<i64>() {
+                let var = trimmed[..idx].trim();
+                if let Ok(lhs) = env.get(var) {
+                    if let Ok(v) = lhs.parse::<i64>() {
+                        return Ok((v - off).to_string());
+                    }
+                }
+            }
         }
     }
-    env.get(expr.trim())
+    env.get(trimmed)
 }
 
 /// Convert lisp-form symbol `aws-vpc` → terraform-form `aws_vpc`.
