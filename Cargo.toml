@@ -23,6 +23,4 @@ thiserror = "2"
 lava-core = { git = "https://github.com/pleme-io/lava-core", branch = "main" }
 lava-arch = { git = "https://github.com/pleme-io/lava-arch", branch = "main" }
 lava-schema = { git = "https://github.com/pleme-io/lava-schema", branch = "main" }
-
-[dev-dependencies]
 lava-types = { git = "https://github.com/pleme-io/lava-types", branch = "main" }
