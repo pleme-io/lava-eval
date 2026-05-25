@@ -17,6 +17,7 @@
 use indexmap::IndexMap;
 use lava_arch::Builder;
 use lava_core::{Architecture, Resource, ResourceRef, Value};
+use lava_schema::{Interface, SchemaError};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -38,6 +39,13 @@ pub enum EvalError {
     UnknownVar(String),
     #[error("type mismatch: expected {0}")]
     Type(&'static str),
+    #[error("interface `{interface}` rejected {count} field(s): {first}")]
+    Schema {
+        interface: String,
+        count: usize,
+        first: String,
+        errors: Vec<SchemaError>,
+    },
 }
 
 /// Input binding for a single deflava-architecture evaluation.
@@ -55,6 +63,50 @@ impl InputBindings {
     pub fn set_list(&mut self, k: impl Into<String>, v: Vec<String>) {
         self.lists.insert(k.into(), v);
     }
+}
+
+/// Parse + evaluate a deflava-architecture form against a typed
+/// [`Interface`]. Inputs are validated *before* evaluation; missing
+/// required fields, unknown fields (closed-set interfaces only), and
+/// per-field type mismatches all surface as
+/// [`EvalError::Schema`] before any resource is constructed.
+///
+/// This is the GraphQL-equivalent gate: typed-contract failure at
+/// compose-time, not at apply-time.
+///
+/// # Errors
+/// [`EvalError::Schema`] when the bag violates the interface;
+/// otherwise delegates to [`eval_architecture`].
+pub fn eval_architecture_with_schema(
+    src: &str,
+    bindings: &InputBindings,
+    iface: &Interface,
+) -> Result<Architecture, EvalError> {
+    // Project the InputBindings into the IndexMap<String,String> shape
+    // lava-schema expects. Lists are joined with comma — lava-schema
+    // currently treats lists as opaque strings; per-element typing
+    // happens in lava-types::ListOf which we do not yet thread through
+    // here. The scalar+list distinction is the InputBindings concern,
+    // not the schema concern.
+    let mut bag: IndexMap<String, String> = IndexMap::new();
+    for (k, v) in &bindings.scalars {
+        bag.insert(k.clone(), v.clone());
+    }
+    for (k, v) in &bindings.lists {
+        bag.insert(k.clone(), v.join(","));
+    }
+    if let Err(errors) = iface.validate_inputs(&bag) {
+        let first = errors
+            .first()
+            .map_or_else(|| "unknown".to_string(), std::string::ToString::to_string);
+        return Err(EvalError::Schema {
+            interface: iface.name.clone(),
+            count: errors.len(),
+            first,
+            errors,
+        });
+    }
+    eval_architecture(src, bindings)
 }
 
 /// Parse + evaluate a deflava-architecture form. Supplies any missing
@@ -331,5 +383,58 @@ mod tests {
     #[test]
     fn sym_to_type_id_replaces_dashes() {
         assert_eq!(sym_to_type_id("aws-internet-gateway"), "aws_internet_gateway");
+    }
+
+    #[test]
+    fn schema_validation_rejects_bad_input_before_evaluation() {
+        use lava_schema::{Field, Interface};
+        use lava_types::Type;
+
+        let mut iface = Interface::new("demo-vpc");
+        iface
+            .inputs
+            .insert("cidr".to_string(), Field::strict(Type::CidrBlock));
+
+        let src = r#"
+            (deflava-architecture demo-vpc
+              :inputs ((:cidr "10.0.0.0/16"))
+              :resources ((aws-vpc "demo" :cidr-block "{cidr}")))
+        "#;
+
+        let mut bindings = InputBindings::new();
+        bindings.set_str("cidr", "not-a-cidr-at-all");
+
+        let err = eval_architecture_with_schema(src, &bindings, &iface).unwrap_err();
+        match err {
+            EvalError::Schema { interface, count, .. } => {
+                assert_eq!(interface, "demo-vpc");
+                assert_eq!(count, 1);
+            }
+            other => panic!("expected EvalError::Schema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_validation_passes_with_valid_input() {
+        use lava_schema::{Field, Interface};
+        use lava_types::Type;
+
+        let mut iface = Interface::new("demo-vpc");
+        iface
+            .inputs
+            .insert("cidr".to_string(), Field::strict(Type::CidrBlock));
+
+        let src = r#"
+            (deflava-architecture demo-vpc
+              :inputs ((:cidr "10.0.0.0/16"))
+              :resources ((aws-vpc "demo" :cidr-block "{cidr}")))
+        "#;
+
+        let mut bindings = InputBindings::new();
+        bindings.set_str("cidr", "10.42.0.0/16");
+
+        let arch = eval_architecture_with_schema(src, &bindings, &iface).unwrap();
+        let json = arch.render_terraform_json().unwrap();
+        assert_eq!(json["resource"]["aws_vpc"]["demo"]["cidr_block"], "10.42.0.0/16");
     }
 }

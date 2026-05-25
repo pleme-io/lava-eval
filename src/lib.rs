@@ -26,5 +26,5 @@
 pub mod eval;
 pub mod sexpr;
 
-pub use eval::{eval_architecture, EvalError, InputBindings};
+pub use eval::{eval_architecture, eval_architecture_with_schema, EvalError, InputBindings};
 pub use sexpr::{parse, Atom, ParseError, Sx};
