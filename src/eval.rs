@@ -344,6 +344,26 @@ fn build_resource(r: &Sx, env: &Env) -> Result<Option<Resource>, EvalError> {
     }))
 }
 
+/// If `raw` is exactly the shape `{var}` (no other text + no arithmetic),
+/// return the inner var name. Lets eval_value detect list-binding
+/// interpolations and route them as typed arrays rather than scalars.
+fn extract_full_var(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return None;
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    if inner.is_empty() || inner.contains('{') || inner.contains('}') {
+        return None;
+    }
+    if inner.contains('+') || inner.contains('-') {
+        // Arithmetic / kebab — not a simple var lookup; let `interp`
+        // handle it via the scalar path.
+        return None;
+    }
+    Some(inner)
+}
+
 /// Resolve a `:when` value into a typed bool.
 ///
 /// `#t`/`#f` literals are direct. A bare symbol or `{var}`-style
@@ -480,10 +500,33 @@ fn eval_for_each(xs: &[Sx], env: &Env, builder: &mut Builder) -> Result<(), Eval
 
 fn eval_value(s: &Sx, env: &Env) -> Result<Value, EvalError> {
     match s {
-        Sx::Atom(Atom::Str(raw)) => Ok(Value::s(interp(raw, env)?)),
+        Sx::Atom(Atom::Str(raw)) => {
+            // Special-case `{var}` strings where var is a known list:
+            // return the list as a typed array, not a comma-joined scalar.
+            // This lets architectures pass list-bindings into resource
+            // attributes without losing their list shape.
+            if let Some(name) = extract_full_var(raw) {
+                if let Some(items) = env.lists.get(name) {
+                    let arr: Vec<Value> =
+                        items.iter().cloned().map(Value::s).collect();
+                    return Ok(Value::arr(arr));
+                }
+            }
+            Ok(Value::s(interp(raw, env)?))
+        }
         Sx::Atom(Atom::Sym(s)) => {
-            // Bare symbol — resolve as variable.
-            Ok(Value::s(env.get(s)?))
+            // Bare symbol — resolve scalar first, then list. Lets
+            // architectures write `:subnet-ids subnet-ids` and have
+            // the list flow through as Value::arr.
+            if let Ok(v) = env.get(s) {
+                return Ok(Value::s(v));
+            }
+            if let Some(items) = env.lists.get(s) {
+                let arr: Vec<Value> =
+                    items.iter().cloned().map(Value::s).collect();
+                return Ok(Value::arr(arr));
+            }
+            Err(EvalError::UnknownVar(s.to_string()))
         }
         Sx::Atom(Atom::Bool(b)) => Ok(Value::b(*b)),
         Sx::Atom(Atom::Int(n)) => Ok(Value::n(*n)),
