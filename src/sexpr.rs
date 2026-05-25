@@ -12,6 +12,7 @@ pub enum Atom {
     Kw(String),
     Str(String),
     Bool(bool),
+    Int(i64),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -35,6 +36,9 @@ impl Sx {
     }
     pub fn as_bool(&self) -> Option<bool> {
         if let Sx::Atom(Atom::Bool(b)) = self { Some(*b) } else { None }
+    }
+    pub fn as_int(&self) -> Option<i64> {
+        if let Sx::Atom(Atom::Int(n)) = self { Some(*n) } else { None }
     }
 }
 
@@ -180,6 +184,12 @@ impl<'a> Parser<'a> {
     }
     fn read_symbol(&mut self) -> Result<Sx, ParseError> {
         let body = self.read_atom_body();
+        // Try integer parse first — Lisp atoms starting with a digit or
+        // optional leading '-' that resolve to a base-10 i64 are typed
+        // Int atoms. Failure (anything non-numeric) falls back to Sym.
+        if let Ok(n) = body.parse::<i64>() {
+            return Ok(Sx::Atom(Atom::Int(n)));
+        }
         Ok(Sx::Atom(Atom::Sym(body)))
     }
     fn read_atom_body(&mut self) -> String {

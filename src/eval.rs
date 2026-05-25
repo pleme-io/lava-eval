@@ -291,6 +291,7 @@ fn eval_value(s: &Sx, env: &Env) -> Result<Value, EvalError> {
             Ok(Value::s(env.get(s)?))
         }
         Sx::Atom(Atom::Bool(b)) => Ok(Value::b(*b)),
+        Sx::Atom(Atom::Int(n)) => Ok(Value::n(*n)),
         Sx::Atom(Atom::Kw(_)) => Err(EvalError::Type("value (not kw)")),
         Sx::List(items) => {
             // (ref aws-vpc "name" attr) → Value::Ref
@@ -308,7 +309,15 @@ fn eval_value(s: &Sx, env: &Env) -> Result<Value, EvalError> {
                     attribute: attr.to_string(),
                 }));
             }
-            // Tags: nested list of (Key Value) pairs → JSON map.
+            // Flat list of string/symbol atoms → JSON array of strings.
+            // e.g. :bound-ips ("10.0.0.0/8" "10.10.0.0/16").
+            if items.iter().all(|x| matches!(x, Sx::Atom(Atom::Str(_)) | Sx::Atom(Atom::Sym(_)))) {
+                let arr: Result<Vec<Value>, EvalError> =
+                    items.iter().map(|x| eval_value(x, env)).collect();
+                return Ok(Value::arr(arr?));
+            }
+            // Otherwise: nested list of (Key Value) pairs → JSON map
+            // (tag-pair shape).
             let mut map = serde_json::Map::new();
             for pair in items {
                 let p = pair.as_list().ok_or(EvalError::Type("tag pair list"))?;
