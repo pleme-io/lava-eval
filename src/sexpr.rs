@@ -63,6 +63,27 @@ pub fn parse(src: &str) -> Result<Sx, ParseError> {
     Ok(form)
 }
 
+/// Parse zero-or-more top-level forms from a single source string.
+/// Lisp files normally hold multiple top-level forms — `parse_all`
+/// is the surface consumers walk when one file ships several typed
+/// declarations (e.g. `(deflava-interface …)` next to
+/// `(deflava-architecture …)`).
+///
+/// # Errors
+/// Surfaces any parse error encountered while reading a form.
+pub fn parse_all(src: &str) -> Result<Vec<Sx>, ParseError> {
+    let mut p = Parser { src: src.as_bytes(), pos: 0 };
+    let mut forms = Vec::new();
+    loop {
+        p.skip();
+        if p.pos >= p.src.len() {
+            break;
+        }
+        forms.push(p.read_one()?);
+    }
+    Ok(forms)
+}
+
 struct Parser<'a> {
     src: &'a [u8],
     pos: usize,

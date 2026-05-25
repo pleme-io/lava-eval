@@ -21,7 +21,7 @@ use lava_schema::{Interface, SchemaError};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
-use crate::sexpr::{parse, Atom, Sx};
+use crate::sexpr::{parse_all, Atom, Sx};
 
 #[derive(Debug, Error)]
 pub enum EvalError {
@@ -112,11 +112,20 @@ pub fn eval_architecture_with_schema(
 /// Parse + evaluate a deflava-architecture form. Supplies any missing
 /// inputs from the form's declared defaults.
 pub fn eval_architecture(src: &str, bindings: &InputBindings) -> Result<Architecture, EvalError> {
-    let form = parse(src)?;
+    let forms = parse_all(src)?;
+    // A .tlisp file may carry sibling declarations
+    // (e.g. (deflava-interface …) next to (deflava-architecture …)).
+    // Select the deflava-architecture form; the rest are typed
+    // metadata consumed elsewhere.
+    let form = forms
+        .iter()
+        .find(|f| {
+            f.as_list()
+                .and_then(|xs| xs.first().and_then(Sx::as_sym))
+                == Some("deflava-architecture")
+        })
+        .ok_or_else(|| EvalError::NotArchForm("no deflava-architecture form".into()))?;
     let xs = form.as_list().ok_or_else(|| EvalError::NotArchForm("not a list".into()))?;
-    if xs.first().and_then(Sx::as_sym) != Some("deflava-architecture") {
-        return Err(EvalError::NotArchForm("head != deflava-architecture".into()));
-    }
     let arch_name = xs.get(1).and_then(Sx::as_sym).unwrap_or("anonymous").to_string();
 
     // Walk :keyword clauses from position 2.
