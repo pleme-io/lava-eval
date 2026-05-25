@@ -16,7 +16,7 @@
 
 use indexmap::IndexMap;
 use lava_arch::Builder;
-use lava_core::{Architecture, Resource, ResourceRef, Value};
+use lava_core::{Architecture, Multiplicity, ProviderRef, Resource, ResourceRef, Value};
 use lava_schema::{Interface, SchemaError};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -131,12 +131,20 @@ pub fn eval_architecture(src: &str, bindings: &InputBindings) -> Result<Architec
     // Walk :keyword clauses from position 2.
     let mut inputs_clause: Option<&Sx> = None;
     let mut resources_clause: Option<&Sx> = None;
+    let mut data_clause: Option<&Sx> = None;
+    let mut outputs_clause: Option<&Sx> = None;
+    let mut providers_clause: Option<&Sx> = None;
+    let mut locals_clause: Option<&Sx> = None;
     let mut i = 2;
     while i + 1 < xs.len() {
         let key = xs[i].as_kw();
         match key {
             Some("inputs")    => { inputs_clause    = Some(&xs[i + 1]); }
             Some("resources") => { resources_clause = Some(&xs[i + 1]); }
+            Some("data")      => { data_clause      = Some(&xs[i + 1]); }
+            Some("outputs")   => { outputs_clause   = Some(&xs[i + 1]); }
+            Some("providers") => { providers_clause = Some(&xs[i + 1]); }
+            Some("locals")    => { locals_clause    = Some(&xs[i + 1]); }
             // :result clause is for downstream consumers; not needed
             // to render terraform.json.
             Some("result") | Some(_) | None => {}
@@ -192,7 +200,179 @@ pub fn eval_architecture(src: &str, bindings: &InputBindings) -> Result<Architec
         eval_resource(r, &env, &mut builder)?;
     }
 
-    Ok(builder.finish())
+    let mut arch = builder.finish();
+
+    // :data — same shape as resources, lands in arch.data_sources.
+    if let Some(data) = data_clause {
+        let data_list = data
+            .as_list()
+            .ok_or_else(|| EvalError::NotArchForm(":data not a list".into()))?;
+        for d in data_list {
+            let r = build_resource(d, &env)?;
+            arch.data_sources.push(r);
+        }
+    }
+
+    // :outputs ( (:name (ref ...)) (:other (ref ...)) ... )
+    if let Some(outs) = outputs_clause {
+        let pairs = outs
+            .as_list()
+            .ok_or_else(|| EvalError::NotArchForm(":outputs not a list".into()))?;
+        let mut j = 0;
+        while j < pairs.len() {
+            let k = pairs[j]
+                .as_kw()
+                .ok_or_else(|| EvalError::NotArchForm(":outputs head not :kw".into()))?
+                .to_string();
+            let v = pairs
+                .get(j + 1)
+                .ok_or_else(|| EvalError::NotArchForm(":outputs missing value".into()))?;
+            arch.outputs.insert(k, eval_value(v, &env)?);
+            j += 2;
+        }
+    }
+
+    // :providers ( (aws :region "us-east-1") (aws :alias "west" :region "us-west-2") ... )
+    if let Some(provs) = providers_clause {
+        let list = provs
+            .as_list()
+            .ok_or_else(|| EvalError::NotArchForm(":providers not a list".into()))?;
+        for p in list {
+            let provider = build_provider(p, &env)?;
+            arch.providers.push(provider);
+        }
+    }
+
+    // :locals (:key value :key value ...)
+    if let Some(locals) = locals_clause {
+        let pairs = locals
+            .as_list()
+            .ok_or_else(|| EvalError::NotArchForm(":locals not a list".into()))?;
+        let mut j = 0;
+        while j < pairs.len() {
+            let k = pairs[j]
+                .as_kw()
+                .ok_or_else(|| EvalError::NotArchForm(":locals head not :kw".into()))?
+                .replace('-', "_");
+            let v = pairs
+                .get(j + 1)
+                .ok_or_else(|| EvalError::NotArchForm(":locals missing value".into()))?;
+            arch.locals.insert(k, eval_value(v, &env)?);
+            j += 2;
+        }
+    }
+
+    Ok(arch)
+}
+
+/// Build a typed Resource from a `(type-id "name" :attr v ...)` form.
+/// Shared between :resources and :data evaluation.
+fn build_resource(r: &Sx, env: &Env) -> Result<Resource, EvalError> {
+    let xs = r
+        .as_list()
+        .ok_or_else(|| EvalError::NotArchForm("resource not a list".into()))?;
+    let head = xs
+        .first()
+        .and_then(Sx::as_sym)
+        .ok_or_else(|| EvalError::NotArchForm("resource head not sym".into()))?;
+    let type_id = sym_to_type_id(head);
+    let raw_name = xs
+        .get(1)
+        .and_then(Sx::as_str)
+        .ok_or_else(|| EvalError::NotArchForm("resource name not string".into()))?;
+    let name = interp(raw_name, env)?;
+    let mut attrs = IndexMap::new();
+    let mut multiplicity: Option<Multiplicity> = None;
+    let mut i = 2;
+    while i + 1 < xs.len() {
+        let raw_key = xs[i]
+            .as_kw()
+            .ok_or_else(|| EvalError::NotArchForm("attr key not :kw".into()))?;
+        match raw_key {
+            "count" => {
+                let n = xs[i + 1]
+                    .as_int()
+                    .ok_or(EvalError::Type(":count expects integer"))?;
+                multiplicity = Some(Multiplicity::Count(n));
+            }
+            "for-each" => {
+                let map_form = xs[i + 1]
+                    .as_list()
+                    .ok_or(EvalError::Type(":for-each expects key/value pair list"))?;
+                let mut m: IndexMap<String, Value> = IndexMap::new();
+                let mut j = 0;
+                while j + 1 < map_form.len() {
+                    let mk = map_form[j]
+                        .as_kw()
+                        .or_else(|| map_form[j].as_str())
+                        .ok_or(EvalError::Type(":for-each key not :kw|str"))?
+                        .to_string();
+                    let mv = eval_value(&map_form[j + 1], env)?;
+                    m.insert(mk, mv);
+                    j += 2;
+                }
+                multiplicity = Some(Multiplicity::ForEach(m));
+            }
+            _ => {
+                let key = raw_key.replace('-', "_");
+                let val = eval_value(&xs[i + 1], env)?;
+                attrs.insert(key, val);
+            }
+        }
+        i += 2;
+    }
+    Ok(Resource {
+        type_id,
+        name,
+        attributes: attrs,
+        depends_on: vec![],
+        provider: None,
+        multiplicity,
+    })
+}
+
+/// Build a typed ProviderRef from a `(aws :region "us-east-1"
+/// :alias "west" :source "hashicorp/aws")` form.
+fn build_provider(p: &Sx, env: &Env) -> Result<ProviderRef, EvalError> {
+    let xs = p
+        .as_list()
+        .ok_or_else(|| EvalError::NotArchForm("provider not a list".into()))?;
+    let name = xs
+        .first()
+        .and_then(Sx::as_sym)
+        .ok_or_else(|| EvalError::NotArchForm("provider head not sym".into()))?
+        .to_string();
+    let mut alias: Option<String> = None;
+    let mut source = format!("hashicorp/{name}");
+    let mut config: IndexMap<String, Value> = IndexMap::new();
+    let mut i = 1;
+    while i + 1 < xs.len() {
+        let key = xs[i]
+            .as_kw()
+            .ok_or_else(|| EvalError::NotArchForm("provider attr key not :kw".into()))?;
+        match key {
+            "alias" => {
+                alias = xs[i + 1].as_str().map(std::string::ToString::to_string);
+            }
+            "source" => {
+                if let Some(s) = xs[i + 1].as_str() {
+                    source = s.to_string();
+                }
+            }
+            other => {
+                let k = other.replace('-', "_");
+                let v = eval_value(&xs[i + 1], env)?;
+                config.insert(k, v);
+            }
+        }
+        i += 2;
+    }
+    Ok(ProviderRef {
+        source,
+        name,
+        alias,
+        config,
+    })
 }
 
 #[derive(Default)]
@@ -217,35 +397,12 @@ fn eval_resource(r: &Sx, env: &Env, builder: &mut Builder) -> Result<(), EvalErr
     let xs = r.as_list().ok_or_else(|| EvalError::NotArchForm("resource not a list".into()))?;
     let head = xs.first().and_then(Sx::as_sym)
         .ok_or_else(|| EvalError::NotArchForm("resource head not sym".into()))?;
-
     if head == "for-each" {
         // (for-each ((var ix) (enumerate :inputs.list)) <body-resource>)
         return eval_for_each(xs, env, builder);
     }
-
-    // Generic resource: (aws-vpc "name" :attr v :attr v ...)
-    let type_id = sym_to_type_id(head);
-    let raw_name = xs.get(1).and_then(Sx::as_str)
-        .ok_or_else(|| EvalError::NotArchForm("resource name not string".into()))?;
-    let name = interp(raw_name, env)?;
-    let mut attrs = IndexMap::new();
-    let mut i = 2;
-    while i + 1 < xs.len() {
-        let key = xs[i].as_kw()
-            .ok_or_else(|| EvalError::NotArchForm("attr key not :kw".into()))?
-            .replace('-', "_");
-        let val = eval_value(&xs[i + 1], env)?;
-        attrs.insert(key, val);
-        i += 2;
-    }
-    builder.add_resource(Resource {
-        type_id,
-        name,
-        attributes: attrs,
-        depends_on: vec![],
-        provider: None,
-        multiplicity: None,
-    });
+    let resource = build_resource(r, env)?;
+    builder.add_resource(resource);
     Ok(())
 }
 
@@ -451,6 +608,96 @@ mod tests {
             }
             other => panic!("expected EvalError::Schema, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn data_clause_renders_as_terraform_data_block() {
+        let src = r#"
+            (deflava-architecture x
+              :inputs ()
+              :resources ((aws-vpc "main" :cidr-block "10.0.0.0/16"))
+              :data ((aws-ami "ubuntu" :most-recent #t :owners ("099720109477"))))
+        "#;
+        let arch = eval_architecture(src, &InputBindings::new()).unwrap();
+        let json = arch.render_terraform_json().unwrap();
+        assert_eq!(json["data"]["aws_ami"]["ubuntu"]["most_recent"], true);
+        assert_eq!(json["data"]["aws_ami"]["ubuntu"]["owners"][0], "099720109477");
+    }
+
+    #[test]
+    fn outputs_clause_renders_as_terraform_output_block() {
+        let src = r#"
+            (deflava-architecture x
+              :inputs ()
+              :resources ((aws-vpc "main" :cidr-block "10.0.0.0/16"))
+              :outputs (:vpc-id (ref aws-vpc "main" id)
+                        :vpc-cidr "10.0.0.0/16"))
+        "#;
+        let arch = eval_architecture(src, &InputBindings::new()).unwrap();
+        let json = arch.render_terraform_json().unwrap();
+        assert_eq!(json["output"]["vpc-id"]["value"], "${aws_vpc.main.id}");
+        assert_eq!(json["output"]["vpc-cidr"]["value"], "10.0.0.0/16");
+    }
+
+    #[test]
+    fn providers_clause_renders_with_typed_config() {
+        let src = r#"
+            (deflava-architecture x
+              :inputs ()
+              :resources ((aws-vpc "main" :cidr-block "10.0.0.0/16"))
+              :providers ((aws :region "us-east-2" :profile "prod")
+                          (aws :alias "west" :region "us-west-2")))
+        "#;
+        let arch = eval_architecture(src, &InputBindings::new()).unwrap();
+        let json = arch.render_terraform_json().unwrap();
+        // Two configs for "aws" → emitted as a JSON array.
+        let arr = json["provider"]["aws"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["region"], "us-east-2");
+        assert_eq!(arr[1]["alias"], "west");
+        assert_eq!(arr[1]["region"], "us-west-2");
+    }
+
+    #[test]
+    fn locals_clause_renders_under_top_level_locals() {
+        let src = r#"
+            (deflava-architecture x
+              :inputs ()
+              :resources ((aws-vpc "main" :cidr-block "10.0.0.0/16"))
+              :locals (:env "prod" :retry-count 3))
+        "#;
+        let arch = eval_architecture(src, &InputBindings::new()).unwrap();
+        let json = arch.render_terraform_json().unwrap();
+        assert_eq!(json["locals"]["env"], "prod");
+        assert_eq!(json["locals"]["retry_count"], 3);
+    }
+
+    #[test]
+    fn resource_count_meta_arg_renders_as_terraform_count() {
+        let src = r#"
+            (deflava-architecture x
+              :inputs ()
+              :resources ((aws-instance "node" :count 3 :ami "ami-12345" :instance-type "t3.micro")))
+        "#;
+        let arch = eval_architecture(src, &InputBindings::new()).unwrap();
+        let json = arch.render_terraform_json().unwrap();
+        assert_eq!(json["resource"]["aws_instance"]["node"]["count"], 3);
+        assert_eq!(json["resource"]["aws_instance"]["node"]["ami"], "ami-12345");
+    }
+
+    #[test]
+    fn resource_for_each_meta_arg_renders_as_terraform_for_each() {
+        let src = r#"
+            (deflava-architecture x
+              :inputs ()
+              :resources ((aws-s3-bucket "data"
+                            :for-each (:logs "tag-logs" :metrics "tag-metrics")
+                            :bucket "demo")))
+        "#;
+        let arch = eval_architecture(src, &InputBindings::new()).unwrap();
+        let json = arch.render_terraform_json().unwrap();
+        assert_eq!(json["resource"]["aws_s3_bucket"]["data"]["for_each"]["logs"], "tag-logs");
+        assert_eq!(json["resource"]["aws_s3_bucket"]["data"]["for_each"]["metrics"], "tag-metrics");
     }
 
     #[test]
