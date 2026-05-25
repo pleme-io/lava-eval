@@ -24,9 +24,11 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod eval;
+pub mod import;
 pub mod interface;
 pub mod sexpr;
 
 pub use eval::{eval_architecture, eval_architecture_with_schema, EvalError, InputBindings};
+pub use import::{imports_in_source, Import, ImportParseError};
 pub use interface::{interface_from_form, interfaces_in_source, InterfaceParseError};
 pub use sexpr::{parse, parse_all, Atom, ParseError, Sx};
