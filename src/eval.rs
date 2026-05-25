@@ -347,6 +347,13 @@ fn build_resource(r: &Sx, env: &Env) -> Result<Option<Resource>, EvalError> {
 /// If `raw` is exactly the shape `{var}` (no other text + no arithmetic),
 /// return the inner var name. Lets eval_value detect list-binding
 /// interpolations and route them as typed arrays rather than scalars.
+///
+/// Kebab-named vars (e.g. `subnet-ids`) are valid — the `-` inside the
+/// var name is NOT arithmetic. Arithmetic is detected via `+` or
+/// `var-NUM` shape (rfind '-' followed by digits) which `interp`
+/// already handles; here we just gate on no-`+` and treat any `-`
+/// as part of the var name. The end-of-tree var resolution will
+/// fail if the var doesn't exist, so this is safe.
 fn extract_full_var(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
     if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
@@ -356,10 +363,17 @@ fn extract_full_var(raw: &str) -> Option<&str> {
     if inner.is_empty() || inner.contains('{') || inner.contains('}') {
         return None;
     }
-    if inner.contains('+') || inner.contains('-') {
-        // Arithmetic / kebab — not a simple var lookup; let `interp`
-        // handle it via the scalar path.
+    if inner.contains('+') {
+        // var+N arithmetic — scalar-only.
         return None;
+    }
+    // `-NUM` suffix (arithmetic) → scalar. Anything else with `-` is
+    // part of a kebab var name.
+    if let Some(idx) = inner.rfind('-') {
+        let after = &inner[idx + 1..];
+        if !after.is_empty() && after.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
     }
     Some(inner)
 }
