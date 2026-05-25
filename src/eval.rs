@@ -208,8 +208,9 @@ pub fn eval_architecture(src: &str, bindings: &InputBindings) -> Result<Architec
             .as_list()
             .ok_or_else(|| EvalError::NotArchForm(":data not a list".into()))?;
         for d in data_list {
-            let r = build_resource(d, &env)?;
-            arch.data_sources.push(r);
+            if let Some(r) = build_resource(d, &env)? {
+                arch.data_sources.push(r);
+            }
         }
     }
 
@@ -267,7 +268,12 @@ pub fn eval_architecture(src: &str, bindings: &InputBindings) -> Result<Architec
 
 /// Build a typed Resource from a `(type-id "name" :attr v ...)` form.
 /// Shared between :resources and :data evaluation.
-fn build_resource(r: &Sx, env: &Env) -> Result<Resource, EvalError> {
+///
+/// Returns `Ok(None)` if the resource declares `:when #f` (or an
+/// equivalent variable that resolves to a falsy value) — the caller
+/// skips emitting it. Terraform's `count = condition ? 1 : 0`
+/// equivalent in tlisp.
+fn build_resource(r: &Sx, env: &Env) -> Result<Option<Resource>, EvalError> {
     let xs = r
         .as_list()
         .ok_or_else(|| EvalError::NotArchForm("resource not a list".into()))?;
@@ -283,12 +289,16 @@ fn build_resource(r: &Sx, env: &Env) -> Result<Resource, EvalError> {
     let name = interp(raw_name, env)?;
     let mut attrs = IndexMap::new();
     let mut multiplicity: Option<Multiplicity> = None;
+    let mut emit = true;
     let mut i = 2;
     while i + 1 < xs.len() {
         let raw_key = xs[i]
             .as_kw()
             .ok_or_else(|| EvalError::NotArchForm("attr key not :kw".into()))?;
         match raw_key {
+            "when" => {
+                emit = resolve_predicate(&xs[i + 1], env)?;
+            }
             "count" => {
                 let n = xs[i + 1]
                     .as_int()
@@ -321,14 +331,41 @@ fn build_resource(r: &Sx, env: &Env) -> Result<Resource, EvalError> {
         }
         i += 2;
     }
-    Ok(Resource {
+    if !emit {
+        return Ok(None);
+    }
+    Ok(Some(Resource {
         type_id,
         name,
         attributes: attrs,
         depends_on: vec![],
         provider: None,
         multiplicity,
-    })
+    }))
+}
+
+/// Resolve a `:when` value into a typed bool.
+///
+/// `#t`/`#f` literals are direct. A bare symbol or `{var}`-style
+/// string is looked up in the env; truthy values: "true"/"#t"/"1";
+/// falsy: "false"/"#f"/"0"/"". Anything else surfaces as a typed
+/// error.
+fn resolve_predicate(v: &Sx, env: &Env) -> Result<bool, EvalError> {
+    match v {
+        Sx::Atom(Atom::Bool(b)) => Ok(*b),
+        Sx::Atom(Atom::Int(n)) => Ok(*n != 0),
+        Sx::Atom(Atom::Sym(s) | Atom::Str(s)) => {
+            let resolved = interp(s, env)?;
+            match resolved.as_str() {
+                "true" | "#t" | "1" => Ok(true),
+                "false" | "#f" | "0" | "" => Ok(false),
+                other => Err(EvalError::Type(match other {
+                    _ => "boolean (true|false|#t|#f|1|0)",
+                })),
+            }
+        }
+        _ => Err(EvalError::Type("boolean")),
+    }
 }
 
 /// Build a typed ProviderRef from a `(aws :region "us-east-1"
@@ -401,8 +438,9 @@ fn eval_resource(r: &Sx, env: &Env, builder: &mut Builder) -> Result<(), EvalErr
         // (for-each ((var ix) (enumerate :inputs.list)) <body-resource>)
         return eval_for_each(xs, env, builder);
     }
-    let resource = build_resource(r, env)?;
-    builder.add_resource(resource);
+    if let Some(resource) = build_resource(r, env)? {
+        builder.add_resource(resource);
+    }
     Ok(())
 }
 
@@ -698,6 +736,59 @@ mod tests {
         let json = arch.render_terraform_json().unwrap();
         assert_eq!(json["resource"]["aws_s3_bucket"]["data"]["for_each"]["logs"], "tag-logs");
         assert_eq!(json["resource"]["aws_s3_bucket"]["data"]["for_each"]["metrics"], "tag-metrics");
+    }
+
+    #[test]
+    fn when_false_skips_resource_entirely() {
+        let src = r#"
+            (deflava-architecture x
+              :inputs ()
+              :resources ((aws-vpc "main" :when #t :cidr-block "10.0.0.0/16")
+                          (aws-subnet "skip" :when #f :cidr-block "10.0.1.0/24")))
+        "#;
+        let arch = eval_architecture(src, &InputBindings::new()).unwrap();
+        let json = arch.render_terraform_json().unwrap();
+        assert!(json["resource"]["aws_vpc"]["main"].is_object());
+        assert!(json["resource"]["aws_subnet"].is_null(),
+            "aws_subnet should be omitted entirely when :when #f");
+    }
+
+    #[test]
+    fn when_predicate_resolves_variable_bindings() {
+        let src = r#"
+            (deflava-architecture x
+              :inputs ((:enable "true"))
+              :resources ((aws-vpc "main" :when "{enable}" :cidr-block "10.0.0.0/16")))
+        "#;
+        let mut b = InputBindings::new();
+        b.set_str("enable", "true");
+        let arch = eval_architecture(src, &b).unwrap();
+        assert!(arch
+            .render_terraform_json()
+            .unwrap()
+            ["resource"]["aws_vpc"]["main"]
+            .is_object());
+
+        let mut b = InputBindings::new();
+        b.set_str("enable", "false");
+        let arch = eval_architecture(src, &b).unwrap();
+        let json = arch.render_terraform_json().unwrap();
+        assert!(
+            json["resource"].is_null()
+                || json["resource"]["aws_vpc"].is_null(),
+            "vpc should be omitted when :enable=false"
+        );
+    }
+
+    #[test]
+    fn when_with_unparseable_value_surfaces_typed_error() {
+        let src = r#"
+            (deflava-architecture x
+              :inputs ()
+              :resources ((aws-vpc "main" :when "maybe" :cidr-block "10.0.0.0/16")))
+        "#;
+        let err = eval_architecture(src, &InputBindings::new()).unwrap_err();
+        assert!(matches!(err, EvalError::Type(_)));
     }
 
     #[test]
