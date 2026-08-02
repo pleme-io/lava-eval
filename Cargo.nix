@@ -181,14 +181,9 @@ rec {
       };
       "lava-arch" = rec {
         crateName = "lava-arch";
-        version = "0.1.4";
+        version = "0.1.6";
         edition = "2024";
-        workspace_member = null;
-        src = pkgs.fetchgit {
-          url = "https://github.com/pleme-io/lava-arch";
-          rev = "32d07b3af1cdc7805bd2111582d4e4e45ba9ec36";
-          sha256 = "0gn2bnjawxdlsgg5dr56640ja0bhgv3p64jv84kbxdj0r09kwxqb";
-        };
+        sha256 = "1jhdn8k6gfnxsl2lbppqj79y5ba3bffvj9rgd034gq4j12m683by";
         libName = "lava_arch";
         authors = [
           "pleme-io"
@@ -221,14 +216,9 @@ rec {
       };
       "lava-core" = rec {
         crateName = "lava-core";
-        version = "0.1.6";
+        version = "0.1.7";
         edition = "2024";
-        workspace_member = null;
-        src = pkgs.fetchgit {
-          url = "https://github.com/pleme-io/lava-core";
-          rev = "0f5d5c48087b8019166d2cc49c415d4176112248";
-          sha256 = "0imc42qk02gafnr587chx7bz3lh8idbnhpjjgfxiwwsxwdiq4dwd";
-        };
+        sha256 = "1zrcbx8qhmvdlcqp3013a2lxp8mk1ql61ap9i94zf53nqbfm1fzz";
         libName = "lava_core";
         authors = [
           "pleme-io"
@@ -261,7 +251,7 @@ rec {
       };
       "lava-eval" = rec {
         crateName = "lava-eval";
-        version = "0.1.9";
+        version = "0.1.10";
         edition = "2024";
         src = lib.cleanSourceWith { filter = sourceFilter;  src = ./.; };
         libName = "lava_eval";
@@ -308,14 +298,9 @@ rec {
       };
       "lava-schema" = rec {
         crateName = "lava-schema";
-        version = "0.1.5";
+        version = "0.1.7";
         edition = "2024";
-        workspace_member = null;
-        src = pkgs.fetchgit {
-          url = "https://github.com/pleme-io/lava-schema";
-          rev = "f2e77f0428d546ded22e9efbbb51df2d579c74bc";
-          sha256 = "14sv7nkjwifjhrh91cdirq113mn4bz6l6l0cmj90sakgdqyc2w90";
-        };
+        sha256 = "15nzi1liva2cg5ds8nix0zhypsf94vihgvajm3r5i6snhv0ncfnq";
         libName = "lava_schema";
         authors = [
           "pleme-io"
@@ -346,12 +331,7 @@ rec {
         crateName = "lava-types";
         version = "0.1.2";
         edition = "2024";
-        workspace_member = null;
-        src = pkgs.fetchgit {
-          url = "https://github.com/pleme-io/lava-types";
-          rev = "1e2b9ee81e00140e12513ff3fad6f074549ec83a";
-          sha256 = "1ryg1csgdpla40kr1qvx41cvj00j9ya14nk3bq6nih1l8qn6pvii";
-        };
+        sha256 = "1bi09a9l0b10p8qf5xm1hkplsyfs0ni669rj1njd3v6dn3dfmvr4";
         libName = "lava_types";
         authors = [
           "pleme-io"
@@ -371,9 +351,9 @@ rec {
       };
       "memchr" = rec {
         crateName = "memchr";
-        version = "2.8.1";
+        version = "2.8.3";
         edition = "2021";
-        sha256 = "1n448jx01h5z2xknj6x2dhxgr8s8fb717cf6vfqj5lmhkpj7m53b";
+        sha256 = "161xa63ipfanf8v3nb82xd5hqgydv55nzw59wyngqbz6alfaz2yg";
         authors = [
           "Andrew Gallant <jamslam@gmail.com>"
           "bluss"
@@ -411,9 +391,9 @@ rec {
       };
       "quote" = rec {
         crateName = "quote";
-        version = "1.0.45";
+        version = "1.0.46";
         edition = "2021";
-        sha256 = "095rb5rg7pbnwdp6v8w5jw93wndwyijgci1b5lw8j1h5cscn3wj1";
+        sha256 = "0s034glrlav8nzqy2yskqzv52ncy82k126sm2jk5j1vs1iylbg6z";
         authors = [
           "David Tolnay <dtolnay@gmail.com>"
         ];
@@ -621,9 +601,9 @@ rec {
       };
       "syn" = rec {
         crateName = "syn";
-        version = "2.0.117";
+        version = "2.0.119";
         edition = "2021";
-        sha256 = "16cv7c0wbn8amxc54n4w15kxlx5ypdmla8s0gxr2l7bv7s0bhrg6";
+        sha256 = "15vjy620l91a3q4n4f4gzhnflmdr6pnm38v2m6cpk86i8av32a47";
         authors = [
           "David Tolnay <dtolnay@gmail.com>"
         ];
@@ -722,9 +702,9 @@ rec {
       };
       "zmij" = rec {
         crateName = "zmij";
-        version = "1.0.21";
+        version = "1.0.23";
         edition = "2021";
-        sha256 = "1amb5i6gz7yjb0dnmz5y669674pqmwbj44p4yfxfv2ncgvk8x15q";
+        sha256 = "06zwri21nnrl34rwinmvbciap8yk1mrl8qfg9pff7lgspc56sri9";
         authors = [
           "David Tolnay <dtolnay@gmail.com>"
         ];
