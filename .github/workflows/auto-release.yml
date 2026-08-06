@@ -12,4 +12,9 @@ on:
 jobs:
   release:
     uses: pleme-io/substrate/.github/workflows/cargo-auto-release.yml@main
+    with:
+      # The dispatch input above was DECLARED and never FORWARDED, so an
+      # operator choosing `minor`/`major` silently got `patch`. The canonical
+      # shim (pleme-io/shikumi) has always carried this line.
+      bump-type: ${{ inputs.bump-type || 'patch' }}
     secrets: inherit
