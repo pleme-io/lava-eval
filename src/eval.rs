@@ -27,6 +27,12 @@ use crate::sexpr::{parse_all, Atom, Sx};
 pub enum EvalError {
     #[error("parse: {0}")]
     Parse(#[from] crate::sexpr::ParseError),
+    /// A `(deflava-dashboard …)` form parsed but did not describe a
+    /// valid document. Carries the typed document error's own message so
+    /// the caller sees *which* panel and *why* without this crate having
+    /// to re-model lava-core's error set.
+    #[error("dashboard: {0}")]
+    Dashboard(String),
     #[error("expected deflava-architecture form, got {0}")]
     NotArchForm(String),
     #[error("missing :{0} clause")]
@@ -447,7 +453,7 @@ fn build_provider(p: &Sx, env: &Env) -> Result<ProviderRef, EvalError> {
 }
 
 #[derive(Default)]
-struct Env {
+pub(crate) struct Env {
     scalars: BTreeMap<String, String>,
     lists: BTreeMap<String, Vec<String>>,
     // Loop-local single-element scalars (i, az).
@@ -455,7 +461,7 @@ struct Env {
 }
 
 impl Env {
-    fn new() -> Self { Self::default() }
+    pub(crate) fn new() -> Self { Self::default() }
     /// Resolve a `{var}` reference. Loop-local wins over global.
     fn get(&self, key: &str) -> Result<String, EvalError> {
         if let Some(s) = self.loop_scalars.get(key) { return Ok(s.clone()); }
@@ -512,7 +518,7 @@ fn eval_for_each(xs: &[Sx], env: &Env, builder: &mut Builder) -> Result<(), Eval
     Ok(())
 }
 
-fn eval_value(s: &Sx, env: &Env) -> Result<Value, EvalError> {
+pub(crate) fn eval_value(s: &Sx, env: &Env) -> Result<Value, EvalError> {
     match s {
         Sx::Atom(Atom::Str(raw)) => {
             // Special-case `{var}` strings where var is a known list:
@@ -640,25 +646,71 @@ fn eval_value(s: &Sx, env: &Env) -> Result<Value, EvalError> {
     }
 }
 
+/// Is this braced span a variable reference, or someone else's syntax?
+///
+/// `{}` is not ours alone. A PromQL label matcher
+/// (`vector_component_errors_total{component_kind="sink"}`), a Go
+/// template, a JSON object embedded in a string — all use braces, and
+/// treating them as interpolation turns an ordinary query into
+/// `UnknownVar("component_kind=\"sink\"")`.
+///
+/// So a span is a variable reference only if it *looks* like one:
+/// `name`, `name+3`, `name-1`, where the name is identifier-shaped
+/// (alphanumerics, `-`, `_`). Anything else is left byte-for-byte alone.
+///
+/// This keeps the typo check that makes `{regoin}` an error while
+/// letting foreign brace syntax through — the alternative, requiring
+/// authors to double every brace in a PromQL selector, trades a rare
+/// typo for a constant tax.
+fn is_var_reference(expr: &str) -> bool {
+    let core = expr.trim();
+    if core.is_empty() {
+        return false;
+    }
+    // Split an optional trailing +N / -N arithmetic tail.
+    let name = match core.rfind(['+', '-']) {
+        Some(idx) if idx > 0 && core[idx + 1..].trim().parse::<i64>().is_ok() => {
+            core[..idx].trim()
+        }
+        _ => core,
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// Substitute `{var}` and arithmetic-light `{var+N}` in template strings.
-fn interp(template: &str, env: &Env) -> Result<String, EvalError> {
+///
+/// Spans that are not variable references pass through untouched — see
+/// [`is_var_reference`].
+pub(crate) fn interp(template: &str, env: &Env) -> Result<String, EvalError> {
     let mut out = String::with_capacity(template.len());
-    let bytes = template.as_bytes();
+    // Char indices, not raw bytes: the previous implementation pushed
+    // `bytes[i] as char`, which is a byte→char cast rather than a UTF-8
+    // decode, so any non-ASCII byte in a template was mangled into a
+    // Latin-1 codepoint.
+    let chars: Vec<char> = template.chars().collect();
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'{' {
-            // Find matching '}'.
-            let end = bytes[i + 1..].iter().position(|c| *c == b'}')
-                .map(|p| i + 1 + p);
-            if let Some(j) = end {
-                let expr = std::str::from_utf8(&bytes[i + 1..j])
-                    .map_err(|_| EvalError::Type("utf8 in template"))?;
-                out.push_str(&eval_template_expr(expr, env)?);
+    while i < chars.len() {
+        if chars[i] == '{' {
+            if let Some(off) = chars[i + 1..].iter().position(|c| *c == '}') {
+                let j = i + 1 + off;
+                let expr: String = chars[i + 1..j].iter().collect();
+                if is_var_reference(&expr) {
+                    out.push_str(&eval_template_expr(&expr, env)?);
+                    i = j + 1;
+                    continue;
+                }
+                // Foreign brace syntax — emit the span verbatim.
+                out.push('{');
+                out.push_str(&expr);
+                out.push('}');
                 i = j + 1;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
+        out.push(chars[i]);
         i += 1;
     }
     Ok(out)

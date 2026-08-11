@@ -54,6 +54,8 @@ pub enum ParseError {
     UnexpectedClose(usize),
     #[error("expected single top-level form, got {0}")]
     MultipleForms(usize),
+    #[error("string starting at offset {0} is not valid UTF-8")]
+    InvalidUtf8(usize),
 }
 
 pub fn parse(src: &str) -> Result<Sx, ParseError> {
@@ -143,26 +145,44 @@ impl<'a> Parser<'a> {
         }
         Ok(Sx::List(out))
     }
+    /// Read a string literal.
+    ///
+    /// Bytes are accumulated and decoded as UTF-8 at the end rather than
+    /// pushed one at a time. `out.push(byte as char)` is a byte→char
+    /// cast, not a decode: it maps every byte to the codepoint of the
+    /// same value, so a multi-byte character is silently split into its
+    /// Latin-1 lookalikes and `·` (U+00B7, `C2 B7`) reads back as `Â·`.
+    /// The parser stays byte-oriented — every delimiter it looks for is
+    /// ASCII, and a UTF-8 continuation byte can never be mistaken for
+    /// one — so only the accumulation had to change.
     fn read_string(&mut self) -> Result<Sx, ParseError> {
         let start = self.pos;
         self.bump(); // "
-        let mut out = String::new();
+        let mut out: Vec<u8> = Vec::new();
         while let Some(c) = self.peek() {
             match c {
-                b'"' => { self.bump(); return Ok(Sx::Atom(Atom::Str(out))); }
+                b'"' => {
+                    self.bump();
+                    return String::from_utf8(out)
+                        .map(|s| Sx::Atom(Atom::Str(s)))
+                        .map_err(|_| ParseError::InvalidUtf8(start));
+                }
                 b'\\' => {
                     self.bump();
                     match self.bump() {
-                        Some(b'n') => out.push('\n'),
-                        Some(b'r') => out.push('\r'),
-                        Some(b't') => out.push('\t'),
-                        Some(b'\\') => out.push('\\'),
-                        Some(b'"') => out.push('"'),
-                        Some(other) => out.push(other as char),
+                        Some(b'n') => out.push(b'\n'),
+                        Some(b'r') => out.push(b'\r'),
+                        Some(b't') => out.push(b'\t'),
+                        Some(b'\\') => out.push(b'\\'),
+                        Some(b'"') => out.push(b'"'),
+                        Some(other) => out.push(other),
                         None => return Err(ParseError::UnterminatedString(start)),
                     }
                 }
-                _ => { self.bump(); out.push(c as char); }
+                _ => {
+                    self.bump();
+                    out.push(c);
+                }
             }
         }
         Err(ParseError::UnterminatedString(start))
@@ -192,16 +212,21 @@ impl<'a> Parser<'a> {
         }
         Ok(Sx::Atom(Atom::Sym(body)))
     }
+    /// Read a symbol / keyword body. Accumulates bytes and decodes once,
+    /// for the same reason [`Parser::read_string`] does. Invalid UTF-8
+    /// degrades to a lossy decode rather than failing: an atom body is
+    /// matched against known form names, so a mangled one produces a
+    /// clear "unknown form" rather than a parse error pointing at a byte.
     fn read_atom_body(&mut self) -> String {
-        let mut out = String::new();
+        let mut out: Vec<u8> = Vec::new();
         while let Some(c) = self.peek() {
             if matches!(c, b' ' | b'\t' | b'\n' | b'\r' | b'(' | b')' | b';' | b',') {
                 break;
             }
             self.bump();
-            out.push(c as char);
+            out.push(c);
         }
-        out
+        String::from_utf8_lossy(&out).into_owned()
     }
 }
 
