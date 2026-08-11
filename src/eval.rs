@@ -561,25 +561,81 @@ fn eval_value(s: &Sx, env: &Env) -> Result<Value, EvalError> {
                     attribute: attr.to_string(),
                 }));
             }
-            // Flat list of string/symbol atoms → JSON array of strings.
-            // e.g. :bound-ips ("10.0.0.0/8" "10.10.0.0/16").
-            if items.iter().all(|x| matches!(x, Sx::Atom(Atom::Str(_)) | Sx::Atom(Atom::Sym(_)))) {
-                let arr: Result<Vec<Value>, EvalError> =
-                    items.iter().map(|x| eval_value(x, env)).collect();
-                return Ok(Value::arr(arr?));
+            // An empty list stays an empty array — the shape it has always
+            // had here. lava-chart reads `()` as Null; nothing in the
+            // architecture corpus writes one, so the divergence is
+            // currently unobservable and preserving today's behaviour is
+            // the cheaper of the two free choices.
+            if items.is_empty() {
+                return Ok(Value::arr([]));
             }
-            // Otherwise: nested list of (Key Value) pairs → JSON map
-            // (tag-pair shape).
-            let mut map = serde_json::Map::new();
-            for pair in items {
-                let p = pair.as_list().ok_or(EvalError::Type("tag pair list"))?;
-                let k_sym = p.first().and_then(Sx::as_sym)
-                    .ok_or(EvalError::Type("tag key sym"))?;
-                let v_raw = p.get(1).and_then(Sx::as_str)
-                    .ok_or(EvalError::Type("tag val str"))?;
-                map.insert(k_sym.to_string(), serde_json::Value::String(interp(v_raw, env)?));
+
+            // ── maps are recognised by SYNTAX, never by sniffing ──────
+            //
+            // The previous implementation disambiguated on content: "all
+            // elements are Str/Sym atoms" meant array, anything else meant
+            // map. That is why the map branch could not nest — widening it
+            // to admit non-atoms would have swallowed every array. Two
+            // explicit map syntaxes plus a general array fallback lets both
+            // recurse without either eating the other.
+            //
+            // Measured before changing this: across all 35 bundled
+            // architectures there are 87 list-valued positions — 36 refs,
+            // 18 arrays and 33 maps, every map a `:tags` pair-list. Naively
+            // relaxing the old array gate flips all 33 to arrays-of-arrays
+            // and breaks 23 of the 35 files, because Terraform rejects a
+            // list where it wants map(string).
+
+            // (1) tag-pair map: `((Name "web") (Env "dev"))`. Gated on EVERY
+            //     element being a 2-element sym-headed list, so an array
+            //     whose first element happens to be a pair is still an
+            //     array. Values now recurse instead of being forced to a
+            //     string, so `(Count 3)` and nested maps become expressible
+            //     — both were `EvalError::Type("tag val str")` before.
+            let is_tag_pair_map = items.iter().all(|x| {
+                x.as_list().is_some_and(|p| {
+                    p.len() == 2 && p.first().and_then(Sx::as_sym).is_some()
+                })
+            });
+            if is_tag_pair_map {
+                let mut map: IndexMap<String, Value> = IndexMap::new();
+                for pair in items {
+                    let p = pair.as_list().ok_or(EvalError::Type("tag pair list"))?;
+                    let k_sym = p
+                        .first()
+                        .and_then(Sx::as_sym)
+                        .ok_or(EvalError::Type("tag key sym"))?;
+                    map.insert(k_sym.to_string(), eval_value(&p[1], env)?);
+                }
+                return Ok(Value::Map(map));
             }
-            Ok(Value::Json(serde_json::Value::Object(map)))
+
+            // (2) keyword plist: `(:host "db" :port 5432)`. New — a leading
+            //     keyword was `EvalError::Type("value (not kw)")` before, so
+            //     this admits a shape that could not previously parse at
+            //     all and cannot regress anything. It is the same nested-map
+            //     syntax lava-chart already accepts, which is what lets the
+            //     two crates share one grammar.
+            if items.first().and_then(Sx::as_kw).is_some() {
+                if items.len() % 2 != 0 {
+                    return Err(EvalError::Type("keyword map: odd number of elements"));
+                }
+                let mut map: IndexMap<String, Value> = IndexMap::new();
+                for kv in items.chunks_exact(2) {
+                    let k = kv[0].as_kw().ok_or(EvalError::Type("keyword map key"))?;
+                    map.insert(k.to_string(), eval_value(&kv[1], env)?);
+                }
+                return Ok(Value::Map(map));
+            }
+
+            // (3) everything else is an array, and it recurses. This is what
+            //     makes `((ref aws-nat-gateway "{name}-nat" id))` work —
+            //     authors already write arrays-of-refs in `:result`, and
+            //     they only got away with it because eval_architecture
+            //     discards that clause unevaluated.
+            let arr: Result<Vec<Value>, EvalError> =
+                items.iter().map(|x| eval_value(x, env)).collect();
+            Ok(Value::arr(arr?))
         }
     }
 }
