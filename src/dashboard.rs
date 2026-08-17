@@ -287,11 +287,26 @@ fn panel_from(p: &Value) -> Result<Panel, EvalError> {
         query.legend = qm.get("legend").and_then(as_str).map(ToString::to_string);
         query.instant = matches!(qm.get("instant"), Some(Value::Bool(true)));
         query.hide = matches!(qm.get("hide"), Some(Value::Bool(true)));
+        // An unknown :presence is an ERROR, not a silent Continuous.
+        //
+        // The wildcard arm used to swallow every typo. Measured 2026-08-17
+        // across the lava-architectures catalogue: 14 queries in 5 shipped
+        // boards were authored `:presence "event_driven"` with an underscore,
+        // matched nothing, and fell through to Continuous — the exact opposite
+        // of what the author wrote, since event-driven means "empty is GOOD"
+        // and continuous means "empty is a problem".
+        //
+        // Nothing could catch it downstream: Presence is not emitted into the
+        // Grafana document at all, so the render is BYTE-IDENTICAL either way
+        // and the dashboard matrix cannot see the difference. A field whose
+        // only consumer is upstream of the artifact has to be validated here
+        // or nowhere.
         if let Some(p) = qm.get("presence").and_then(as_str) {
             query.presence = match p {
                 "event-driven" => Presence::EventDriven,
                 "conditional" => Presence::Conditional,
-                _ => Presence::Continuous,
+                "continuous" => Presence::Continuous,
+                _ => return Err(EvalError::Type("query :presence must be one of \"event-driven\", \"conditional\", \"continuous\"")),
             };
         }
         if let Some(Value::Map(alts)) = qm.get("alt-exprs") {
