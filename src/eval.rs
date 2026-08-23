@@ -496,6 +496,14 @@ pub(crate) struct Env {
     /// flattening one to a delimited value would make every architecture
     /// parse its own input.
     records: BTreeMap<String, Vec<BTreeMap<String, String>>>,
+    /// The CURRENT row's fields, during a record `for-each`.
+    ///
+    /// Deliberately distinct from `loop_scalars` even though both are
+    /// loop-local, because only these are SHAPE-TYPED on a whole-value
+    /// reference — see `eval_value`. Keeping them apart is what makes that
+    /// typing opt-in to record iteration rather than a behaviour change for
+    /// every architecture that already interpolates a scalar.
+    record_scalars: BTreeMap<String, String>,
 }
 
 impl Env {
@@ -564,12 +572,20 @@ fn eval_for_each(xs: &[Sx], env: &Env, builder: &mut Builder) -> Result<(), Eval
                 lists: env.lists.clone(),
                 loop_scalars: env.loop_scalars.clone(),
                 records: env.records.clone(),
+                // Populated per row below — never inherited, so a field
+                // absent from THIS row cannot resolve to the previous
+                // row's value.
+                record_scalars: BTreeMap::new(),
             };
             scoped.loop_scalars.insert(i_var.clone(), i.to_string());
             for (field, value) in row {
-                scoped
-                    .loop_scalars
-                    .insert(format!("{item_var}_{field}"), value.clone());
+                let key = format!("{item_var}_{field}");
+                // BOTH maps, on purpose. loop_scalars keeps mid-string
+                // interpolation working (`"repo-{repo_name}-suffix"`);
+                // record_scalars additionally marks the value as eligible for
+                // shape-typing when it is referenced as a WHOLE value.
+                scoped.loop_scalars.insert(key.clone(), value.clone());
+                scoped.record_scalars.insert(key, value.clone());
             }
             eval_resource(body, &scoped, builder)?;
         }
@@ -586,12 +602,35 @@ fn eval_for_each(xs: &[Sx], env: &Env, builder: &mut Builder) -> Result<(), Eval
             lists: env.lists.clone(),
             loop_scalars: env.loop_scalars.clone(),
             records: env.records.clone(),
+            record_scalars: BTreeMap::new(),
         };
         scoped.loop_scalars.insert(i_var.clone(), i.to_string());
         scoped.loop_scalars.insert(item_var.clone(), item.clone());
         eval_resource(body, &scoped, builder)?;
     }
     Ok(())
+}
+
+/// Type a record field by its shape, matching what a BARE atom of the same
+/// text would have become.
+///
+/// The rules are the language's existing ones, not new ones: `true`/`false`
+/// are booleans, canonical decimals are numbers, everything else is text.
+/// Canonical matters — `"0042"` stays a string, because re-typing it to 42
+/// yields a DIFFERENT identifier, and zero-padded ids are common enough that
+/// the silent case is worth closing.
+fn typed_scalar(s: &str) -> Value {
+    match s {
+        "true" => return Value::b(true),
+        "false" => return Value::b(false),
+        _ => {}
+    }
+    if let Ok(n) = s.parse::<i64>() {
+        if n.to_string() == s {
+            return Value::n(n);
+        }
+    }
+    Value::s(s.to_string())
 }
 
 pub(crate) fn eval_value(s: &Sx, env: &Env) -> Result<Value, EvalError> {
@@ -606,6 +645,22 @@ pub(crate) fn eval_value(s: &Sx, env: &Env) -> Result<Value, EvalError> {
                     let arr: Vec<Value> =
                         items.iter().cloned().map(Value::s).collect();
                     return Ok(Value::arr(arr));
+                }
+                // ── ★ A RECORD FIELD REFERENCED WHOLE IS SHAPE-TYPED ─────
+                // `:has_issues "{repo_has_issues}"` must render the JSON
+                // boolean `true`, not the string `"true"` — terraform's
+                // schema types that attribute as a bool, and the Ruby
+                // renderer this ports emits a real one. A quoted boolean is
+                // the kind of divergence that applies cleanly and shows up
+                // only as a diff against the oracle.
+                //
+                // Scoped to record fields, and to WHOLE-value references
+                // only. A scalar :input keeps rendering as a string, so no
+                // existing architecture changes shape; and a field used
+                // inside a larger string ("v{repo_major}") is still text,
+                // because there the surrounding characters make it text.
+                if let Some(v) = env.record_scalars.get(name) {
+                    return Ok(typed_scalar(v));
                 }
             }
             Ok(Value::s(interp(raw, env)?))
