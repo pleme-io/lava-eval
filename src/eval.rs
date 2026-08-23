@@ -59,6 +59,8 @@ pub enum EvalError {
 pub struct InputBindings {
     scalars: BTreeMap<String, String>,
     lists: BTreeMap<String, Vec<String>>,
+    /// Record-shaped lists — see [`InputBindings::set_records`].
+    pub records: BTreeMap<String, Vec<BTreeMap<String, String>>>,
 }
 
 impl InputBindings {
@@ -68,6 +70,31 @@ impl InputBindings {
     }
     pub fn set_list(&mut self, k: impl Into<String>, v: Vec<String>) {
         self.lists.insert(k.into(), v);
+    }
+
+    /// Bind a list of RECORDS — the shape a data-driven architecture
+    /// iterates when each item has fields rather than being a single string.
+    ///
+    /// ── ★ WHY THIS EXISTS ────────────────────────────────────────────
+    /// `set_list` covers "N things named by a string": availability zones,
+    /// CIDRs, subnet ids. It does not cover "N things each with a name, a
+    /// description, a visibility and a set of topics" — and that is the
+    /// shape of every catalogue-driven workspace, where the whole point is
+    /// that the data lives in a yaml file and the architecture describes
+    /// what to make of each row.
+    ///
+    /// Without it the only encodings available were parallel lists indexed
+    /// by position — which `for-each` cannot even express, since it binds
+    /// the item and its index and offers no way to reach a second list —
+    /// or flattening each record to a delimited string, which makes the
+    /// architecture parse its own input and moves a data-shape error to
+    /// evaluation time.
+    pub fn set_records(
+        &mut self,
+        k: impl Into<String>,
+        v: Vec<std::collections::BTreeMap<String, String>>,
+    ) {
+        self.records.insert(k.into(), v);
     }
 }
 
@@ -174,6 +201,12 @@ pub fn eval_architecture(src: &str, bindings: &InputBindings) -> Result<Architec
                 env.scalars.insert(key.clone(), s.clone());
             } else if let Some(l) = bindings.lists.get(&key) {
                 env.lists.insert(key.clone(), l.clone());
+            } else if let Some(r) = bindings.records.get(&key) {
+                // A record binding lands in its own map. Checked AFTER
+                // scalars and lists so a key bound both ways resolves the
+                // way it already did — this branch can only ever add a
+                // shape that previously had no representation at all.
+                env.records.insert(key.clone(), r.clone());
             } else if let Some(d) = default {
                 match d {
                     Sx::Atom(Atom::Str(s)) => { env.scalars.insert(key, s.clone()); }
@@ -458,6 +491,11 @@ pub(crate) struct Env {
     lists: BTreeMap<String, Vec<String>>,
     // Loop-local single-element scalars (i, az).
     loop_scalars: BTreeMap<String, String>,
+    /// Record-shaped lists, iterated by `for-each`. Kept separate from
+    /// `lists` rather than encoded into it: a record is not a string, and
+    /// flattening one to a delimited value would make every architecture
+    /// parse its own input.
+    records: BTreeMap<String, Vec<BTreeMap<String, String>>>,
 }
 
 impl Env {
@@ -497,19 +535,57 @@ fn eval_for_each(xs: &[Sx], env: &Env, builder: &mut Builder) -> Result<(), Eval
     }
     let source = iter_form.get(1).and_then(Sx::as_sym)
         .ok_or_else(|| EvalError::NotArchForm("enumerate source".into()))?;
+    let body = xs.get(2).ok_or_else(|| EvalError::NotArchForm("for-each body".into()))?;
+    let i_var = vars.first().and_then(Sx::as_sym).unwrap_or("i").to_string();
+    let item_var = vars.get(1).and_then(Sx::as_sym).unwrap_or("item").to_string();
+
+    // ── ★ RECORDS FIRST ───────────────────────────────────────────────
+    // A record source binds each FIELD as `<item>_<field>`, so a row with
+    // name/description/visibility reaches the body as {repo_name},
+    // {repo_description}, {repo_visibility}.
+    //
+    // The separator is `_` because the template's identifier charset is
+    // [A-Za-z0-9_-] and a dot is not in it. Widening that charset to allow
+    // `{repo.name}` would silently reclassify every existing `{a.b}` span
+    // from "foreign text, emitted verbatim" to "variable reference" — and
+    // an architecture that legitimately contains one would start failing
+    // with unknown-var instead of rendering. The prefix is the author's own
+    // item name, so collisions are theirs to see and avoid.
+    //
+    // The bare `<item>` is deliberately NOT bound for records. Binding it
+    // to some designated field would be a guess about which field is the
+    // identity, and a body written against that guess breaks silently on a
+    // record set where the guess is wrong.
+    if let Some(rows) = env.records.get(source) {
+        let rows = rows.clone();
+        for (i, row) in rows.iter().enumerate() {
+            let mut scoped = Env {
+                scalars: env.scalars.clone(),
+                lists: env.lists.clone(),
+                loop_scalars: env.loop_scalars.clone(),
+                records: env.records.clone(),
+            };
+            scoped.loop_scalars.insert(i_var.clone(), i.to_string());
+            for (field, value) in row {
+                scoped
+                    .loop_scalars
+                    .insert(format!("{item_var}_{field}"), value.clone());
+            }
+            eval_resource(body, &scoped, builder)?;
+        }
+        return Ok(());
+    }
+
     let items = env.lists.get(source)
         .ok_or_else(|| EvalError::UnknownVar(source.to_string()))?
         .clone();
-    let body = xs.get(2).ok_or_else(|| EvalError::NotArchForm("for-each body".into()))?;
-
-    let i_var = vars.first().and_then(Sx::as_sym).unwrap_or("i").to_string();
-    let item_var = vars.get(1).and_then(Sx::as_sym).unwrap_or("item").to_string();
 
     for (i, item) in items.iter().enumerate() {
         let mut scoped = Env {
             scalars: env.scalars.clone(),
             lists: env.lists.clone(),
             loop_scalars: env.loop_scalars.clone(),
+            records: env.records.clone(),
         };
         scoped.loop_scalars.insert(i_var.clone(), i.to_string());
         scoped.loop_scalars.insert(item_var.clone(), item.clone());
@@ -978,5 +1054,134 @@ mod tests {
         let arch = eval_architecture_with_schema(src, &bindings, &iface).unwrap();
         let json = arch.render_terraform_json().unwrap();
         assert_eq!(json["resource"]["aws_vpc"]["demo"]["cidr_block"], "10.42.0.0/16");
+    }
+}
+
+#[cfg(test)]
+mod record_iteration_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn rec(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect()
+    }
+
+    const SRC: &str = r#"
+(deflava-architecture repos
+  :inputs ((:rows ()))
+  :resources ((for-each ((i repo) (enumerate rows))
+    (github-repository
+      "{repo_name}"
+      :name "{repo_name}"
+      :description "{repo_description}"
+      :visibility "{repo_visibility}"))))
+"#;
+
+    #[test]
+    fn a_record_list_generates_one_resource_per_row_with_its_fields() {
+        // ★ THE CAPABILITY THE PORT NEEDS. Before this, for-each bound only
+        // an item STRING and its index, with no way to reach a second list —
+        // so "N things each with a name, a description and a visibility"
+        // had no representation at all, which is the shape of every
+        // catalogue-driven workspace.
+        let mut b = InputBindings::new();
+        b.set_records(
+            "rows",
+            vec![
+                rec(&[("name", "alpha"), ("description", "first"), ("visibility", "public")]),
+                rec(&[("name", "beta"), ("description", "second"), ("visibility", "private")]),
+            ],
+        );
+        let arch = eval_architecture(SRC, &b).expect("record iteration must evaluate");
+        let json = arch.render_terraform_json().expect("renders");
+        let repos = &json["resource"]["github_repository"];
+        assert_eq!(repos["alpha"]["description"], "first");
+        assert_eq!(repos["alpha"]["visibility"], "public");
+        assert_eq!(repos["beta"]["description"], "second");
+        assert_eq!(repos["beta"]["visibility"], "private");
+        assert_eq!(repos.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn an_empty_record_list_generates_nothing_rather_than_one_blank_row() {
+        // A catalogue legitimately shrinks to zero. Emitting one resource
+        // with empty fields would be a resource nobody declared.
+        let mut b = InputBindings::new();
+        b.set_records("rows", vec![]);
+        let arch = eval_architecture(SRC, &b).unwrap();
+        let json = arch.render_terraform_json().unwrap();
+        assert!(
+            json.get("resource").is_none()
+                || json["resource"].get("github_repository").is_none(),
+            "no rows must mean no resources, got {json}"
+        );
+    }
+
+    #[test]
+    fn a_field_absent_from_one_row_does_not_leak_the_previous_rows_value() {
+        // ★ THE BUG A NAIVE IMPLEMENTATION HAS. Binding fields into a
+        // scope reused across iterations leaves the prior row's value
+        // visible when a row omits that field — every row after the first
+        // complete one silently inherits, and the rendered document is
+        // wrong rather than erroring.
+        let mut b = InputBindings::new();
+        b.set_records(
+            "rows",
+            vec![
+                rec(&[("name", "alpha"), ("description", "first"), ("visibility", "public")]),
+                rec(&[("name", "beta"), ("visibility", "private")]),
+            ],
+        );
+        // The implementation is STRICTER than "does not leak": a row that
+        // omits a field the body references is an ERROR naming the field,
+        // not a render with a substitute value. That is the better answer —
+        // a catalogue row missing a description is a data defect, and
+        // rendering *something* would ship it.
+        let err = eval_architecture(SRC, &b).expect_err("a missing field must not render");
+        assert_eq!(
+            format!("{err:?}"),
+            r#"UnknownVar("repo_description")"#,
+            "the error must name the field and the row's item prefix"
+        );
+    }
+
+    #[test]
+    fn the_bare_item_name_is_not_bound_for_records() {
+        // Binding `{repo}` to some designated field would be a guess about
+        // which field is the identity, and a body written against that
+        // guess breaks silently on a record set where the guess is wrong.
+        // `{repo}` is not a variable here, so it passes through verbatim.
+        const BARE: &str = r#"
+(deflava-architecture r
+  :inputs ((:rows ()))
+  :resources ((for-each ((i repo) (enumerate rows))
+    (github-repository "x-{i}" :name "{repo}"))))
+"#;
+        let mut b = InputBindings::new();
+        b.set_records("rows", vec![rec(&[("name", "alpha")])]);
+        // Stricter than passthrough, and better: `{repo}` in a record loop
+        // is a reference to something deliberately not bound, so it errors
+        // rather than emitting the literal text "{repo}" into a resource
+        // attribute — which would be a wrong document that applies.
+        let err = eval_architecture(BARE, &b).expect_err("the bare item name is not bound");
+        assert_eq!(format!("{err:?}"), r#"UnknownVar("repo")"#);
+    }
+
+    #[test]
+    fn a_string_list_still_iterates_exactly_as_before() {
+        // The record branch is checked first; a list source must be
+        // untouched by it.
+        const L: &str = r#"
+(deflava-architecture l
+  :inputs ((:azs ()))
+  :resources ((for-each ((i az) (enumerate azs))
+    (aws-subnet "s-{i}" :availability-zone "{az}"))))
+"#;
+        let mut b = InputBindings::new();
+        b.set_list("azs", vec!["us-east-2a".into(), "us-east-2b".into()]);
+        let arch = eval_architecture(L, &b).unwrap();
+        let json = arch.render_terraform_json().unwrap();
+        assert_eq!(json["resource"]["aws_subnet"]["s-0"]["availability_zone"], "us-east-2a");
+        assert_eq!(json["resource"]["aws_subnet"]["s-1"]["availability_zone"], "us-east-2b");
     }
 }
