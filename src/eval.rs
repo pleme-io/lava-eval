@@ -524,6 +524,36 @@ fn eval_resource(r: &Sx, env: &Env, builder: &mut Builder) -> Result<(), EvalErr
         // (for-each ((var ix) (enumerate :inputs.list)) <body-resource>)
         return eval_for_each(xs, env, builder);
     }
+    // ── ★ (import "<address>" "<id>" [:when <pred>]) ────────────────────
+    // Handled HERE, in the resource position, rather than as its own
+    // top-level clause — and that placement is the feature. An adoption is
+    // per-object and usually conditional ("adopt iff it already exists"), so
+    // it has to sit where `for-each` and `:when` already work. A separate
+    // `:imports` clause would need its own iteration and its own predicate,
+    // reimplementing both.
+    if head == "import" {
+        let to_raw = xs
+            .get(1)
+            .and_then(Sx::as_str)
+            .ok_or_else(|| EvalError::NotArchForm("import address not a string".into()))?;
+        let id_raw = xs
+            .get(2)
+            .and_then(Sx::as_str)
+            .ok_or_else(|| EvalError::NotArchForm("import id not a string".into()))?;
+        // An optional trailing :when, same spelling as a resource's.
+        let mut emit = true;
+        let mut i = 3;
+        while i + 1 < xs.len() {
+            if xs[i].as_kw() == Some("when") {
+                emit = resolve_predicate(&xs[i + 1], env)?;
+            }
+            i += 2;
+        }
+        if emit {
+            builder.add_import(interp(to_raw, env)?, interp(id_raw, env)?);
+        }
+        return Ok(());
+    }
     if let Some(resource) = build_resource(r, env)? {
         builder.add_resource(resource);
     }
@@ -1238,5 +1268,68 @@ mod record_iteration_tests {
         let json = arch.render_terraform_json().unwrap();
         assert_eq!(json["resource"]["aws_subnet"]["s-0"]["availability_zone"], "us-east-2a");
         assert_eq!(json["resource"]["aws_subnet"]["s-1"]["availability_zone"], "us-east-2b");
+    }
+}
+
+#[cfg(test)]
+mod import_form_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn rec(p: &[(&str, &str)]) -> BTreeMap<String, String> {
+        p.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect()
+    }
+
+    const SRC: &str = r#"
+(deflava-architecture adopt
+  :inputs ((:rows ()))
+  :resources ((for-each ((i r) (enumerate rows))
+     (github-repository "{r_name}" :name "{r_name}"))
+    (for-each ((i r) (enumerate rows))
+      (import "github_repository.{r_name}" "{r_name}" :when "{r_exists}"))))
+"#;
+
+    #[test]
+    fn imports_are_emitted_per_row_and_gated() {
+        // ★ THE WHOLE POINT: adopt what exists, create what does not. Both
+        // rows get a resource; only the existing one gets an import.
+        let mut b = InputBindings::new();
+        b.set_records(
+            "rows",
+            vec![
+                rec(&[("name", "alpha"), ("exists", "true")]),
+                rec(&[("name", "beta"), ("exists", "false")]),
+            ],
+        );
+        let arch = eval_architecture(SRC, &b).expect("evaluates");
+        let json = arch.render_terraform_json().expect("renders");
+        assert_eq!(json["resource"]["github_repository"].as_object().unwrap().len(), 2);
+        let imports = json["import"].as_array().expect("an import array");
+        assert_eq!(imports.len(), 1, "only the existing repo is adopted: {imports:?}");
+        assert_eq!(imports[0]["to"], "github_repository.alpha");
+        assert_eq!(imports[0]["id"], "alpha");
+    }
+
+    #[test]
+    fn no_row_exists_means_no_import_block_at_all() {
+        let mut b = InputBindings::new();
+        b.set_records("rows", vec![rec(&[("name", "alpha"), ("exists", "false")])]);
+        let arch = eval_architecture(SRC, &b).unwrap();
+        let json = arch.render_terraform_json().unwrap();
+        assert!(json.get("import").is_none(), "greenfield carries no adoption: {json}");
+    }
+
+    #[test]
+    fn a_malformed_import_is_an_error_not_a_skipped_adoption() {
+        // A silently-dropped import is the worst outcome available: the plan
+        // then proposes CREATE for something that exists, and fails at apply
+        // with 422 rather than at synthesis.
+        const BAD: &str = r#"
+(deflava-architecture bad
+  :inputs ()
+  :resources ((import "github_repository.x")))
+"#;
+        let err = eval_architecture(BAD, &InputBindings::new()).expect_err("must not be skipped");
+        assert!(format!("{err}").contains("import id"), "got {err}");
     }
 }
