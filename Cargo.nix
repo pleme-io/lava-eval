@@ -216,9 +216,9 @@ rec {
       };
       "lava-core" = rec {
         crateName = "lava-core";
-        version = "0.2.1";
+        version = "0.2.2";
         edition = "2024";
-        sha256 = "0qk3asd1654vx7nm5g7ixic8rwi92yvcz7pj63nfvqa0az1h1pm0";
+        sha256 = "1yhw3575dvkh66mjg22pz1lb4gv9qkpswxqz56v4lykwhccvrr53";
         libName = "lava_core";
         authors = [
           "pleme-io"
@@ -252,7 +252,7 @@ rec {
       };
       "lava-eval" = rec {
         crateName = "lava-eval";
-        version = "0.2.1";
+        version = "0.2.2";
         edition = "2024";
         src = lib.cleanSourceWith { filter = sourceFilter;  src = ./.; };
         libName = "lava_eval";
@@ -640,9 +640,9 @@ rec {
       };
       "thiserror" = rec {
         crateName = "thiserror";
-        version = "2.0.19";
+        version = "2.0.20";
         edition = "2021";
-        sha256 = "1ngwxsjsa64v1n7vb90h2b0i3fqk1piwaf0z6fqdacqfhjc3b909";
+        sha256 = "0kxs6p295jffxhzaxpxv1dwaaf5iqlm6sx8h0djp6ancbxgj71pc";
         authors = [
           "David Tolnay <dtolnay@gmail.com>"
         ];
@@ -659,9 +659,9 @@ rec {
       };
       "thiserror-impl" = rec {
         crateName = "thiserror-impl";
-        version = "2.0.19";
+        version = "2.0.20";
         edition = "2021";
-        sha256 = "1ka10pqy1g8zy5al9m8yadg30jp8hx0q80j8awmd8131yw6gxjs3";
+        sha256 = "1bwjc94gi0xn5jz26h1a8bjj1wdkvvr6jifamyc4mp9n28zcs15w";
         procMacro = true;
         libName = "thiserror_impl";
         authors = [
