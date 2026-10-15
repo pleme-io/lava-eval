@@ -554,6 +554,30 @@ fn eval_resource(r: &Sx, env: &Env, builder: &mut Builder) -> Result<(), EvalErr
         }
         return Ok(());
     }
+    // (moved "<from-address>" "<to-address>" [:when <pred>]) — same
+    // placement and gating as `import`, so a per-row rename sits in a for-each.
+    if head == "moved" {
+        let from_raw = xs
+            .get(1)
+            .and_then(Sx::as_str)
+            .ok_or_else(|| EvalError::NotArchForm("moved from-address not a string".into()))?;
+        let to_raw = xs
+            .get(2)
+            .and_then(Sx::as_str)
+            .ok_or_else(|| EvalError::NotArchForm("moved to-address not a string".into()))?;
+        let mut emit = true;
+        let mut i = 3;
+        while i + 1 < xs.len() {
+            if xs[i].as_kw() == Some("when") {
+                emit = resolve_predicate(&xs[i + 1], env)?;
+            }
+            i += 2;
+        }
+        if emit {
+            builder.add_moved(interp(from_raw, env)?, interp(to_raw, env)?);
+        }
+        return Ok(());
+    }
     if let Some(resource) = build_resource(r, env)? {
         builder.add_resource(resource);
     }
@@ -1268,6 +1292,42 @@ mod record_iteration_tests {
         let json = arch.render_terraform_json().unwrap();
         assert_eq!(json["resource"]["aws_subnet"]["s-0"]["availability_zone"], "us-east-2a");
         assert_eq!(json["resource"]["aws_subnet"]["s-1"]["availability_zone"], "us-east-2b");
+    }
+}
+
+#[cfg(test)]
+mod moved_form_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    const SRC: &str = r#"
+(deflava-architecture rename
+  :inputs ((:repos ()) (:moves ()))
+  :resources ((for-each ((i r) (enumerate repos))
+     (github-repository "{r_slug}" :name "{r_name}"))
+    (for-each ((i m) (enumerate moves))
+      (moved "github_repository.{m_from}" "github_repository.{m_to}"))))
+"#;
+
+    #[test]
+    fn a_moved_form_renders_one_block_per_row() {
+        let mut b = InputBindings::new();
+        let rec = |p: &[(&str, &str)]| -> BTreeMap<String, String> {
+            p.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect()
+        };
+        b.set_records("repos", vec![rec(&[("slug", "new_one"), ("name", "new-one")])]);
+        b.set_records("moves", vec![rec(&[("from", "old_one"), ("to", "new_one")])]);
+        let arch = eval_architecture(SRC, &b).unwrap();
+        let json = arch.render_terraform_json().unwrap();
+        assert_eq!(json["moved"][0]["from"], "github_repository.old_one");
+        assert_eq!(json["moved"][0]["to"], "github_repository.new_one");
+    }
+
+    #[test]
+    fn a_malformed_moved_is_an_error() {
+        let src = "(deflava-architecture x :resources ((moved \"github_repository.a\")))";
+        let err = eval_architecture(src, &InputBindings::new()).unwrap_err();
+        assert!(format!("{err}").contains("moved to-address"), "got {err}");
     }
 }
 
