@@ -877,7 +877,11 @@ pub(crate) fn interp(template: &str, env: &Env) -> Result<String, EvalError> {
     // Latin-1 codepoint.
     let chars: Vec<char> = template.chars().collect();
     let mut i = 0;
+    let mut tf_end: Option<usize> = None;
     while i < chars.len() {
+        if chars[i] == '$' && chars.get(i + 1) == Some(&'{') {
+            tf_end = matching_brace(&chars, i + 1);
+        }
         if chars[i] == '{' {
             if let Some(off) = chars[i + 1..].iter().position(|c| *c == '}') {
                 let j = i + 1 + off;
@@ -885,6 +889,11 @@ pub(crate) fn interp(template: &str, env: &Env) -> Result<String, EvalError> {
                 if is_var_reference(&expr) {
                     out.push_str(&eval_template_expr(&expr, env)?);
                     i = j + 1;
+                    continue;
+                }
+                if tf_end.is_some_and(|e| i < e) {
+                    out.push('{');
+                    i += 1;
                     continue;
                 }
                 // Foreign brace syntax — emit the span verbatim.
@@ -899,6 +908,24 @@ pub(crate) fn interp(template: &str, env: &Env) -> Result<String, EvalError> {
         i += 1;
     }
     Ok(out)
+}
+
+/// Index of the `}` closing the `{` at `open`, counting nesting; `None` when unclosed.
+fn matching_brace(chars: &[char], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (k, c) in chars.iter().enumerate().skip(open) {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(k);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Evaluate a template-string expression: `var` | `var+N` | `var-N`.
@@ -949,6 +976,22 @@ fn sym_to_type_id(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn variables_inside_a_terraform_expression_are_substituted() {
+        let mut env = Env::new();
+        env.scalars.insert("site".into(), "web".into());
+        env.scalars.insert("host".into(), "www.acme.example".into());
+        let src = "${{for d in aws_acm_certificate.{site}.domain_validation_options : d.domain_name => d}[\"{host}\"].resource_record_name}";
+        assert_eq!(
+            interp(src, &env).unwrap(),
+            "${{for d in aws_acm_certificate.web.domain_validation_options : d.domain_name => d}[\"www.acme.example\"].resource_record_name}"
+        );
+        assert_eq!(
+            interp("${data.aws_route53_zone.{site}.zone_id}", &env).unwrap(),
+            "${data.aws_route53_zone.web.zone_id}"
+        );
+    }
 
     #[test]
     fn interpolates_simple_var() {
