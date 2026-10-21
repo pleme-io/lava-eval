@@ -234,7 +234,7 @@ pub fn eval_architecture(src: &str, bindings: &InputBindings) -> Result<Architec
     let resources = resources_clause.ok_or(EvalError::MissingClause("resources"))?;
     let resource_list = resources.as_list().ok_or_else(|| EvalError::NotArchForm(":resources not a list".into()))?;
 
-    let mut builder = Builder::new(arch_name);
+    let mut builder = Builder::new(arch_name.clone());
     for r in resource_list {
         eval_resource(r, &env, &mut builder)?;
     }
@@ -247,9 +247,9 @@ pub fn eval_architecture(src: &str, bindings: &InputBindings) -> Result<Architec
             .as_list()
             .ok_or_else(|| EvalError::NotArchForm(":data not a list".into()))?;
         for d in data_list {
-            if let Some(r) = build_resource(d, &env)? {
-                arch.data_sources.push(r);
-            }
+            let mut data_builder = Builder::new(arch_name.clone());
+            eval_resource(d, &env, &mut data_builder)?;
+            arch.data_sources.extend(data_builder.finish().resources);
         }
     }
 
@@ -1039,6 +1039,28 @@ mod tests {
             }
             other => panic!("expected EvalError::Schema, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn data_clause_iterates_record_rows() {
+        let src = r#"
+            (deflava-architecture x
+              :inputs ((:rows ()))
+              :resources ()
+              :data ((for-each ((i row) (enumerate rows))
+                       (aws-route53-zone "{row_slug}" :name "{row_zone}"))))
+        "#;
+        let mut b = InputBindings::new();
+        let rec = |n: &str, z: &str| {
+            [("slug", n), ("zone", z)]
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        b.set_records("rows", vec![rec("a", "a.example"), rec("b", "b.example")]);
+        let json = eval_architecture(src, &b).unwrap().render_terraform_json().unwrap();
+        assert_eq!(json["data"]["aws_route53_zone"]["a"]["name"], "a.example");
+        assert_eq!(json["data"]["aws_route53_zone"]["b"]["name"], "b.example");
     }
 
     #[test]
