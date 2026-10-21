@@ -45,6 +45,12 @@ pub enum EvalError {
     UnknownVar(String),
     #[error("type mismatch: expected {0}")]
     Type(&'static str),
+    #[error("input `{input}` declares {declared}, got `{value}`")]
+    Declared {
+        input: String,
+        declared: &'static str,
+        value: String,
+    },
     #[error("interface `{interface}` rejected {count} field(s): {first}")]
     Schema {
         interface: String,
@@ -54,18 +60,203 @@ pub enum EvalError {
     },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum Scalar {
+    Text(String),
+    Number(serde_json::Number),
+    Bool(bool),
+}
+
+impl Scalar {
+    #[must_use]
+    pub fn from_json(v: &serde_json::Value) -> Option<Self> {
+        match v {
+            serde_json::Value::String(s) => Some(Self::Text(s.clone())),
+            serde_json::Value::Number(n) => Some(Self::Number(n.clone())),
+            serde_json::Value::Bool(b) => Some(Self::Bool(*b)),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn text(&self) -> String {
+        match self {
+            Self::Text(s) => s.clone(),
+            Self::Number(n) => n.to_string(),
+            Self::Bool(b) => b.to_string(),
+        }
+    }
+
+    fn value(&self) -> Value {
+        match self {
+            Self::Text(s) => Value::s(s.clone()),
+            Self::Bool(b) => Value::b(*b),
+            Self::Number(n) => n
+                .as_i64()
+                .map_or_else(|| Value::f(n.as_f64().unwrap_or(f64::NAN)), Value::n),
+        }
+    }
+}
+
+impl From<String> for Scalar {
+    fn from(s: String) -> Self { Self::Text(s) }
+}
+
+impl From<&str> for Scalar {
+    fn from(s: &str) -> Self { Self::Text(s.to_string()) }
+}
+
+impl From<bool> for Scalar {
+    fn from(b: bool) -> Self { Self::Bool(b) }
+}
+
+impl From<i64> for Scalar {
+    fn from(n: i64) -> Self { Self::Number(n.into()) }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Declared {
+    Text,
+    Integer,
+    Number,
+    Boolean,
+}
+
+impl Declared {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Text => ":string",
+            Self::Integer => ":integer",
+            Self::Number => ":number",
+            Self::Boolean => ":boolean",
+        }
+    }
+
+    fn of_type_form(t: &Sx) -> Option<Self> {
+        match t {
+            Sx::Atom(Atom::Kw(k)) => match k.as_str() {
+                "integer" => Some(Self::Integer),
+                "number" => Some(Self::Number),
+                "boolean" => Some(Self::Boolean),
+                "any" | "dynamic" => None,
+                _ => Some(Self::Text),
+            },
+            Sx::List(items) => match items.first().and_then(Sx::as_kw) {
+                Some("int-range") => Some(Self::Integer),
+                Some("enum" | "pattern" | "length") => Some(Self::Text),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn of_field_kw(k: &str) -> Result<Self, EvalError> {
+        match k {
+            "string" => Ok(Self::Text),
+            "integer" => Ok(Self::Integer),
+            "number" => Ok(Self::Number),
+            "boolean" => Ok(Self::Boolean),
+            _ => Err(EvalError::Type("record field type :string | :integer | :number | :boolean")),
+        }
+    }
+
+    fn apply(self, input: &str, v: Scalar) -> Result<Scalar, EvalError> {
+        let refuse = |v: &Scalar| EvalError::Declared {
+            input: input.to_string(),
+            declared: self.name(),
+            value: v.text(),
+        };
+        match (self, v) {
+            (Self::Text, v) => Ok(Scalar::Text(v.text())),
+            (Self::Integer, Scalar::Number(n)) if n.is_i64() || n.is_u64() => Ok(Scalar::Number(n)),
+            (Self::Integer, Scalar::Text(t)) => t
+                .parse::<i64>()
+                .map(|n| Scalar::Number(n.into()))
+                .map_err(|_| refuse(&Scalar::Text(t))),
+            (Self::Number, Scalar::Number(n)) => Ok(Scalar::Number(n)),
+            (Self::Number, Scalar::Text(t)) => t
+                .parse::<serde_json::Number>()
+                .map(Scalar::Number)
+                .map_err(|_| refuse(&Scalar::Text(t))),
+            (Self::Boolean, Scalar::Bool(b)) => Ok(Scalar::Bool(b)),
+            (Self::Boolean, Scalar::Text(t)) if t == "true" => Ok(Scalar::Bool(true)),
+            (Self::Boolean, Scalar::Text(t)) if t == "false" => Ok(Scalar::Bool(false)),
+            (_, v) => Err(refuse(&v)),
+        }
+    }
+}
+
+#[derive(Default)]
+struct Declarations {
+    scalars: BTreeMap<String, Declared>,
+    fields: BTreeMap<String, BTreeMap<String, Declared>>,
+}
+
+impl Declarations {
+    fn from_forms(forms: &[Sx], arch_name: &str) -> Result<Self, EvalError> {
+        let mut out = Self::default();
+        let Some(xs) = forms.iter().filter_map(Sx::as_list).find(|xs| {
+            xs.first().and_then(Sx::as_sym) == Some("deflava-interface")
+                && xs.get(1).and_then(Sx::as_sym) == Some(arch_name)
+        }) else {
+            return Ok(out);
+        };
+        let Some(inputs) = xs
+            .chunks(2)
+            .skip(1)
+            .find(|kv| kv.first().and_then(Sx::as_kw) == Some("inputs"))
+            .and_then(|kv| kv.get(1))
+            .and_then(Sx::as_list)
+        else {
+            return Ok(out);
+        };
+        for field in inputs.iter().filter_map(Sx::as_list) {
+            let Some(name) = field.first().and_then(Sx::as_kw) else { continue };
+            for kv in field[1..].chunks_exact(2) {
+                match kv[0].as_kw() {
+                    Some("type") => {
+                        if let Some(d) = Declared::of_type_form(&kv[1]) {
+                            out.scalars.insert(name.to_string(), d);
+                        }
+                    }
+                    Some("fields") => {
+                        let plist = kv[1]
+                            .as_list()
+                            .ok_or(EvalError::Type(":fields expects a keyword plist"))?;
+                        let mut types = BTreeMap::new();
+                        for fk in plist.chunks(2) {
+                            let (Some(f), Some(t)) =
+                                (fk[0].as_kw(), fk.get(1).and_then(Sx::as_kw))
+                            else {
+                                return Err(EvalError::Type(":fields expects :name :type pairs"));
+                            };
+                            types.insert(f.to_string(), Declared::of_field_kw(t)?);
+                        }
+                        out.fields.insert(name.to_string(), types);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// Input binding for a single deflava-architecture evaluation.
 #[derive(Debug, Clone, Default)]
 pub struct InputBindings {
-    scalars: BTreeMap<String, String>,
+    scalars: BTreeMap<String, Scalar>,
     lists: BTreeMap<String, Vec<String>>,
     /// Record-shaped lists — see [`InputBindings::set_records`].
-    pub records: BTreeMap<String, Vec<BTreeMap<String, String>>>,
+    pub records: BTreeMap<String, Vec<BTreeMap<String, Scalar>>>,
 }
 
 impl InputBindings {
     pub fn new() -> Self { Self::default() }
     pub fn set_str(&mut self, k: impl Into<String>, v: impl Into<String>) {
+        self.scalars.insert(k.into(), Scalar::Text(v.into()));
+    }
+    pub fn set_scalar(&mut self, k: impl Into<String>, v: impl Into<Scalar>) {
         self.scalars.insert(k.into(), v.into());
     }
     pub fn set_list(&mut self, k: impl Into<String>, v: Vec<String>) {
@@ -94,6 +285,14 @@ impl InputBindings {
         k: impl Into<String>,
         v: Vec<std::collections::BTreeMap<String, String>>,
     ) {
+        let rows = v
+            .into_iter()
+            .map(|row| row.into_iter().map(|(f, x)| (f, Scalar::Text(x))).collect())
+            .collect();
+        self.records.insert(k.into(), rows);
+    }
+
+    pub fn set_scalar_records(&mut self, k: impl Into<String>, v: Vec<BTreeMap<String, Scalar>>) {
         self.records.insert(k.into(), v);
     }
 }
@@ -123,7 +322,7 @@ pub fn eval_architecture_with_schema(
     // not the schema concern.
     let mut bag: IndexMap<String, String> = IndexMap::new();
     for (k, v) in &bindings.scalars {
-        bag.insert(k.clone(), v.clone());
+        bag.insert(k.clone(), v.text());
     }
     for (k, v) in &bindings.lists {
         bag.insert(k.clone(), v.join(","));
@@ -160,6 +359,7 @@ pub fn eval_architecture(src: &str, bindings: &InputBindings) -> Result<Architec
         .ok_or_else(|| EvalError::NotArchForm("no deflava-architecture form".into()))?;
     let xs = form.as_list().ok_or_else(|| EvalError::NotArchForm("not a list".into()))?;
     let arch_name = xs.get(1).and_then(Sx::as_sym).unwrap_or("anonymous").to_string();
+    let declarations = Declarations::from_forms(&forms, &arch_name)?;
 
     // Walk :keyword clauses from position 2.
     let mut inputs_clause: Option<&Sx> = None;
@@ -196,9 +396,10 @@ pub fn eval_architecture(src: &str, bindings: &InputBindings) -> Result<Architec
                 .to_string();
             // Default sits at plist[1].
             let default = plist.get(1);
+            let declared = declarations.scalars.get(&key).copied();
             // User override wins.
             if let Some(s) = bindings.scalars.get(&key) {
-                env.scalars.insert(key.clone(), s.clone());
+                env.bind_scalar(&key, s.clone(), declared)?;
             } else if let Some(l) = bindings.lists.get(&key) {
                 env.lists.insert(key.clone(), l.clone());
             } else if let Some(r) = bindings.records.get(&key) {
@@ -206,11 +407,13 @@ pub fn eval_architecture(src: &str, bindings: &InputBindings) -> Result<Architec
                 // scalars and lists so a key bound both ways resolves the
                 // way it already did — this branch can only ever add a
                 // shape that previously had no representation at all.
-                env.records.insert(key.clone(), r.clone());
+                let rows = declare_rows(&key, r, declarations.fields.get(&key))?;
+                env.records.insert(key.clone(), rows);
             } else if let Some(d) = default {
                 match d {
-                    Sx::Atom(Atom::Str(s)) => { env.scalars.insert(key, s.clone()); }
-                    Sx::Atom(Atom::Sym(s)) => { env.scalars.insert(key, s.clone()); }
+                    Sx::Atom(Atom::Str(s) | Atom::Sym(s)) => {
+                        env.bind_scalar(&key, Scalar::Text(s.clone()), declared)?;
+                    }
                     Sx::List(items) => {
                         let mut out = Vec::new();
                         for it in items {
@@ -485,7 +688,7 @@ fn build_provider(p: &Sx, env: &Env) -> Result<ProviderRef, EvalError> {
     })
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct Env {
     scalars: BTreeMap<String, String>,
     lists: BTreeMap<String, Vec<String>>,
@@ -495,15 +698,11 @@ pub(crate) struct Env {
     /// `lists` rather than encoded into it: a record is not a string, and
     /// flattening one to a delimited value would make every architecture
     /// parse its own input.
-    records: BTreeMap<String, Vec<BTreeMap<String, String>>>,
-    /// The CURRENT row's fields, during a record `for-each`.
-    ///
-    /// Deliberately distinct from `loop_scalars` even though both are
-    /// loop-local, because only these are SHAPE-TYPED on a whole-value
-    /// reference — see `eval_value`. Keeping them apart is what makes that
-    /// typing opt-in to record iteration rather than a behaviour change for
-    /// every architecture that already interpolates a scalar.
-    record_scalars: BTreeMap<String, String>,
+    records: BTreeMap<String, Vec<BTreeMap<String, Scalar>>>,
+    /// The CURRENT row's fields, during a record `for-each`, each carrying
+    /// the type its binding or its declaration gave it.
+    record_scalars: BTreeMap<String, Value>,
+    typed_scalars: BTreeMap<String, Value>,
 }
 
 impl Env {
@@ -514,6 +713,46 @@ impl Env {
         if let Some(s) = self.scalars.get(key) { return Ok(s.clone()); }
         Err(EvalError::UnknownVar(key.to_string()))
     }
+
+    fn bind_scalar(&mut self, key: &str, v: Scalar, declared: Option<Declared>) -> Result<(), EvalError> {
+        let v = match declared {
+            Some(d) => d.apply(key, v)?,
+            None => v,
+        };
+        self.scalars.insert(key.to_string(), v.text());
+        self.typed_scalars.insert(key.to_string(), v.value());
+        Ok(())
+    }
+
+    fn typed(&self, name: &str) -> Option<Value> {
+        if let Some(v) = self.record_scalars.get(name) {
+            return Some(v.clone());
+        }
+        if self.loop_scalars.contains_key(name) {
+            return None;
+        }
+        self.typed_scalars.get(name).cloned()
+    }
+}
+
+fn declare_rows(
+    input: &str,
+    rows: &[BTreeMap<String, Scalar>],
+    fields: Option<&BTreeMap<String, Declared>>,
+) -> Result<Vec<BTreeMap<String, Scalar>>, EvalError> {
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .map(|(f, v)| {
+                    let v = match fields.and_then(|m| m.get(f)) {
+                        Some(d) => d.apply(&format!("{input}.{f}"), v.clone())?,
+                        None => v.clone(),
+                    };
+                    Ok((f.clone(), v))
+                })
+                .collect()
+        })
+        .collect()
 }
 
 fn eval_resource(r: &Sx, env: &Env, builder: &mut Builder) -> Result<(), EvalError> {
@@ -622,24 +861,21 @@ fn eval_for_each(xs: &[Sx], env: &Env, builder: &mut Builder) -> Result<(), Eval
         let rows = rows.clone();
         for (i, row) in rows.iter().enumerate() {
             let mut scoped = Env {
-                scalars: env.scalars.clone(),
-                lists: env.lists.clone(),
-                loop_scalars: env.loop_scalars.clone(),
-                records: env.records.clone(),
                 // Populated per row below — never inherited, so a field
                 // absent from THIS row cannot resolve to the previous
                 // row's value.
                 record_scalars: BTreeMap::new(),
+                ..env.clone()
             };
             scoped.loop_scalars.insert(i_var.clone(), i.to_string());
             for (field, value) in row {
                 let key = format!("{item_var}_{field}");
                 // BOTH maps, on purpose. loop_scalars keeps mid-string
                 // interpolation working (`"repo-{repo_name}-suffix"`);
-                // record_scalars additionally marks the value as eligible for
-                // shape-typing when it is referenced as a WHOLE value.
-                scoped.loop_scalars.insert(key.clone(), value.clone());
-                scoped.record_scalars.insert(key, value.clone());
+                // record_scalars keeps the field's type for a reference to
+                // the WHOLE value.
+                scoped.loop_scalars.insert(key.clone(), value.text());
+                scoped.record_scalars.insert(key, value.value());
             }
             eval_resource(body, &scoped, builder)?;
         }
@@ -652,39 +888,14 @@ fn eval_for_each(xs: &[Sx], env: &Env, builder: &mut Builder) -> Result<(), Eval
 
     for (i, item) in items.iter().enumerate() {
         let mut scoped = Env {
-            scalars: env.scalars.clone(),
-            lists: env.lists.clone(),
-            loop_scalars: env.loop_scalars.clone(),
-            records: env.records.clone(),
             record_scalars: BTreeMap::new(),
+            ..env.clone()
         };
         scoped.loop_scalars.insert(i_var.clone(), i.to_string());
         scoped.loop_scalars.insert(item_var.clone(), item.clone());
         eval_resource(body, &scoped, builder)?;
     }
     Ok(())
-}
-
-/// Type a record field by its shape, matching what a BARE atom of the same
-/// text would have become.
-///
-/// The rules are the language's existing ones, not new ones: `true`/`false`
-/// are booleans, canonical decimals are numbers, everything else is text.
-/// Canonical matters — `"0042"` stays a string, because re-typing it to 42
-/// yields a DIFFERENT identifier, and zero-padded ids are common enough that
-/// the silent case is worth closing.
-fn typed_scalar(s: &str) -> Value {
-    match s {
-        "true" => return Value::b(true),
-        "false" => return Value::b(false),
-        _ => {}
-    }
-    if let Ok(n) = s.parse::<i64>() {
-        if n.to_string() == s {
-            return Value::n(n);
-        }
-    }
-    Value::s(s.to_string())
 }
 
 pub(crate) fn eval_value(s: &Sx, env: &Env) -> Result<Value, EvalError> {
@@ -700,21 +911,8 @@ pub(crate) fn eval_value(s: &Sx, env: &Env) -> Result<Value, EvalError> {
                         items.iter().cloned().map(Value::s).collect();
                     return Ok(Value::arr(arr));
                 }
-                // ── ★ A RECORD FIELD REFERENCED WHOLE IS SHAPE-TYPED ─────
-                // `:has_issues "{repo_has_issues}"` must render the JSON
-                // boolean `true`, not the string `"true"` — terraform's
-                // schema types that attribute as a bool, and the Ruby
-                // renderer this ports emits a real one. A quoted boolean is
-                // the kind of divergence that applies cleanly and shows up
-                // only as a diff against the oracle.
-                //
-                // Scoped to record fields, and to WHOLE-value references
-                // only. A scalar :input keeps rendering as a string, so no
-                // existing architecture changes shape; and a field used
-                // inside a larger string ("v{repo_major}") is still text,
-                // because there the surrounding characters make it text.
-                if let Some(v) = env.record_scalars.get(name) {
-                    return Ok(typed_scalar(v));
+                if let Some(v) = env.typed(name) {
+                    return Ok(v);
                 }
             }
             Ok(Value::s(interp(raw, env)?))
@@ -723,6 +921,9 @@ pub(crate) fn eval_value(s: &Sx, env: &Env) -> Result<Value, EvalError> {
             // Bare symbol — resolve scalar first, then list. Lets
             // architectures write `:subnet-ids subnet-ids` and have
             // the list flow through as Value::arr.
+            if let Some(v) = env.typed(s) {
+                return Ok(v);
+            }
             if let Ok(v) = env.get(s) {
                 return Ok(Value::s(v));
             }
@@ -1456,5 +1657,98 @@ mod import_form_tests {
 "#;
         let err = eval_architecture(BAD, &InputBindings::new()).expect_err("must not be skipped");
         assert!(format!("{err}").contains("import id"), "got {err}");
+    }
+}
+
+#[cfg(test)]
+mod declared_type_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn rec(p: &[(&str, &str)]) -> BTreeMap<String, String> {
+        p.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect()
+    }
+
+    const SRC: &str = r#"
+(deflava-interface grants
+  :inputs ((:rows :type (:list-of :string) :required #t
+             :fields (:user_id :string :ttl :number :weight :integer :live :boolean))))
+
+(deflava-architecture grants
+  :inputs ((:rows ()))
+  :resources ((for-each ((i g) (enumerate rows))
+    (discord-member-roles "{g_slug}"
+      :user-id "{g_user_id}"
+      :txt "{g_txt}"
+      :ttl "{g_ttl}"
+      :weight "{g_weight}"
+      :live "{g_live}"))))
+"#;
+
+    fn render(b: &InputBindings) -> serde_json::Value {
+        eval_architecture(SRC, b).unwrap().render_terraform_json().unwrap()
+    }
+
+    #[test]
+    fn a_snowflake_declared_string_renders_as_that_exact_string() {
+        let mut b = InputBindings::new();
+        b.set_records(
+            "rows",
+            vec![rec(&[
+                ("slug", "a"),
+                ("user_id", "1234567890123456789"),
+                ("txt", "x"),
+                ("ttl", "300"),
+                ("weight", "2"),
+                ("live", "true"),
+            ])],
+        );
+        let json = render(&b);
+        assert_eq!(
+            json["resource"]["discord_member_roles"]["a"]["user_id"],
+            serde_json::Value::String("1234567890123456789".into())
+        );
+    }
+
+    #[test]
+    fn a_numeric_looking_undeclared_txt_value_stays_a_string() {
+        let mut b = InputBindings::new();
+        b.set_records(
+            "rows",
+            vec![rec(&[
+                ("slug", "a"),
+                ("user_id", "1"),
+                ("txt", "12345"),
+                ("ttl", "300"),
+                ("weight", "2"),
+                ("live", "true"),
+            ])],
+        );
+        let json = render(&b);
+        assert_eq!(
+            json["resource"]["discord_member_roles"]["a"]["txt"],
+            serde_json::Value::String("12345".into())
+        );
+    }
+
+    #[test]
+    fn a_declared_number_stays_a_number() {
+        let mut b = InputBindings::new();
+        b.set_records(
+            "rows",
+            vec![rec(&[
+                ("slug", "a"),
+                ("user_id", "1"),
+                ("txt", "x"),
+                ("ttl", "1.5"),
+                ("weight", "2"),
+                ("live", "true"),
+            ])],
+        );
+        let json = render(&b);
+        let r = &json["resource"]["discord_member_roles"]["a"];
+        assert_eq!(r["ttl"], serde_json::json!(1.5));
+        assert_eq!(r["weight"], serde_json::json!(2));
+        assert_eq!(r["live"], serde_json::json!(true));
     }
 }
