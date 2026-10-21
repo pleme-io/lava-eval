@@ -40,8 +40,9 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "lava-arch"
-version = "0.2.3"
-source = "git+https://github.com/pleme-io/lava-arch?rev=f53e9e011d8080a561238ecda5b4a2b15637a641#f53e9e011d8080a561238ecda5b4a2b15637a641"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36cde49f7426edaa8734e61a41797fcb36e4349b35518536f419c425b204252a"
 dependencies = [
  "indexmap",
  "lava-core",
@@ -52,8 +53,9 @@ dependencies = [
 
 [[package]]
 name = "lava-core"
-version = "0.2.3"
-source = "git+https://github.com/pleme-io/lava-core?rev=d541a050819f99288b1cd797c56f277014195a74#d541a050819f99288b1cd797c56f277014195a74"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ed8e4a4d3548572a37b1d3d13c0ca1833d4e96a51825ee823d3fbc71ab523f4"
 dependencies = [
  "indexmap",
  "serde",
