@@ -1,8 +1,8 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "96f426df24bbcc043b7e10fbf8026250c2bf3930473a8b260fc0293df3c883ca",
+  "cargo_lock_sha256": "d4e2f7f847f263e3ef06b39e51aa6aa8ccce9a6088999f70e3f7b1b8bffd71b7",
   "manifest_sha256": {
-    "Cargo.toml": "f963449a32d493c7ad02345bfdd99f1f2e278c4f39a9f4ea4b424786fab36480"
+    "Cargo.toml": "4cd15cab0dffd80c72163d4895198102dd11947937e8b287e16ac0cb093fc68d"
   },
   "target_resolves": {
     "base": {
@@ -188,7 +188,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "lava-eval-0.2.6": {
+      "lava-eval-0.2.7": {
         "runtime_dependencies": [
           {
             "name": "indexmap",
@@ -782,7 +782,7 @@
     "lava-core-0.2.4": {
       "edition": "2024"
     },
-    "lava-eval-0.2.6": {
+    "lava-eval-0.2.7": {
       "edition": "2024",
       "lib_target": {
         "name": "lava_eval",
