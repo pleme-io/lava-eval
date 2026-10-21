@@ -264,7 +264,7 @@ rec {
       };
       "lava-eval" = rec {
         crateName = "lava-eval";
-        version = "0.2.7";
+        version = "0.2.8";
         edition = "2024";
         src = lib.cleanSourceWith { filter = sourceFilter;  src = ./.; };
         libName = "lava_eval";
