@@ -27,10 +27,14 @@ pub mod dashboard;
 pub mod eval;
 pub mod import;
 pub mod interface;
+pub mod leaf;
 pub mod sexpr;
 
 pub use dashboard::{eval_dashboard, render_dashboard_grafana_json};
-pub use eval::{eval_architecture, eval_architecture_with_schema, EvalError, InputBindings, Scalar};
-pub use import::{imports_in_source, Import, ImportParseError};
-pub use interface::{interface_from_form, interfaces_in_source, InterfaceParseError};
-pub use sexpr::{parse, parse_all, Atom, ParseError, Sx};
+pub use eval::{
+    EvalError, InputBindings, Scalar, eval_architecture, eval_architecture_with_schema,
+};
+pub use import::{Import, ImportParseError, imports_in_source};
+pub use interface::{InterfaceParseError, interface_from_form, interfaces_in_source};
+pub use leaf::{LeafKey, LeafParseError, SliceError, leaf_key_in_source};
+pub use sexpr::{Atom, ParseError, Sx, parse, parse_all};
