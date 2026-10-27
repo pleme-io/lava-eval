@@ -29,6 +29,7 @@ pub mod import;
 pub mod interface;
 pub mod leaf;
 pub mod sexpr;
+pub mod variables;
 
 pub use dashboard::{eval_dashboard, render_dashboard_grafana_json};
 pub use eval::{
@@ -36,5 +37,6 @@ pub use eval::{
 };
 pub use import::{Import, ImportParseError, imports_in_source};
 pub use interface::{InterfaceParseError, interface_from_form, interfaces_in_source};
+pub use variables::VariableError;
 pub use leaf::{LeafKey, LeafParseError, SliceError, leaf_key_in_source};
 pub use sexpr::{Atom, ParseError, Sx, parse, parse_all};
